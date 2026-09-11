@@ -1,0 +1,224 @@
+// hnswsearch.nv — k-nearest search, and the two layers of it the
+// algorithm is made of.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `ef` IS THE KNOB, AND IT IS PER QUERY.  A search keeps a candidate
+// list of `ef` elements as it descends; larger finds more and costs
+// more, and `k` is only how many of them are returned.  `ef` below `k`
+// is a query that cannot return `k` answers, and this package refuses
+// it rather than quietly returning fewer.
+//
+// Everything else about a query is fixed when the index is built.  That
+// asymmetry is the reason `ef` is an argument here and every other
+// parameter is a field on `HnswParams`: the caller changes `ef` between
+// a typeahead and a report over the same index, and changes nothing
+// else without rebuilding.
+//
+// THE DESCENT, IN TWO FUNCTIONS.  `search_layer` is the algorithm's
+// only real routine — a greedy best-first walk over one level from one
+// entry point, keeping `ef` candidates — and `search` is that run once
+// per level from the top with `ef = 1`, then once at level 0 with the
+// caller's `ef`.  Both are public because the second is the whole of
+// HNSW and a caller doing something the top-level API does not cover —
+// a filtered search over a shard, a two-stage re-rank, a recall
+// harness that wants the candidates rather than the answers — needs the
+// first rather than a reimplementation of it.
+//
+// A DELETED ELEMENT IS WALKED THROUGH AND NOT RETURNED.  It is still a
+// hop, because removing it would cut the graph; it is not a result,
+// because it is deleted.  That is hnswlib's behaviour and it means a
+// search of an index that is mostly marks still costs what the graph
+// costs, which is what `hnswgraph.drift` is for.
+//
+// RESULTS ARE SORTED, NEAREST FIRST, AND CARRY THE DISTANCE.  Not the
+// similarity: the distance is what the index compared by, the metric
+// says which one, and a caller that wants a cosine similarity has
+// `1 - d`.  Handing back the number the structure actually used is the
+// only way a caller can check a result against its own arithmetic.
+
+// One answer: a label and how far it was.
+//
+// The distance is under the index's own metric and in the index's own
+// units — squared for L2, because that is what the comparison used.
+// `hnswdist.l2` is there for a caller reporting a real distance to a
+// person.
+//
+// ```novo
+// use hnswsearch
+//
+// fn main() [io]
+//     let h = HnswHit { label: 7, distance: 0.25 }
+//     println("${h.label} at ${h.distance}")
+// ```
+pub struct HnswHit
+    // The caller's own id, as it was handed to `insert`.
+    label: Int
+    // The distance under the index's metric.  Smaller is nearer,
+    // always: the two similarity-shaped metrics are stored as
+    // `1 - similarity` so that every comparison in the package is a
+    // minimum.
+    distance: Float
+
+// One candidate during a descent: an element index and its distance.
+//
+// An element index rather than a label, because that is what the
+// graph is addressed by and a descent that converted per hop would
+// pay for a lookup it does not need.  `search_layer` answers these and
+// `search` converts once, at the end.
+pub struct HnswCandidate
+    // The element's slot in the index, not its label.
+    slot: Int
+    // The distance under the index's metric.
+    distance: Float
+
+// The `k` nearest live elements to a query.
+//
+// Sorted nearest first, and shorter than `k` when the index holds
+// fewer live elements than that.
+//
+// `HnswDimMismatch` for a query of the wrong length, `HnswNotFinite`
+// for one holding a value that is not a number, `HnswZeroNorm` for a
+// zero query under cosine, `HnswEmptyIndex` for an index with nothing
+// in it, and `HnswBadParam` for a `k` below 1 or an `ef` below `k`.
+//
+// ```novo
+// use hnswsearch
+// use hnswgraph
+// use hnswparam
+//
+// fn main() [io]
+//     match hnswparam.default_params(2, HnswL2)
+//         Err(f) => println(f.message())
+//         Ok(p)  =>
+//             match hnswsearch.search(hnswgraph.index(p), [0.0, 0.0], 1, 10)
+//                 Ok(hits) => println("${list.len(hits)}")
+//                 Err(f)   => println(f.message())
+//                             // : an index with nothing in it
+// ```
+pub fn search(ix: HnswIndex, query: [Float], k: Int, ef: Int) -> Result<[HnswHit], HnswFault>
+    todo("hnsw-nv.hnswsearch.search")
+
+// The `k` nearest, with `ef` chosen by `hnswparam.default_ef`.
+//
+// For the caller that has not measured anything yet.  The default is
+// `max(k, ef_construction / 4)`, which is a starting point and not a
+// recommendation — `ef` is the one number worth measuring per
+// workload, and the README says how.
+pub fn search_default(ix: HnswIndex, query: [Float], k: Int) -> Result<[HnswHit], HnswFault>
+    todo("hnsw-nv.hnswsearch.search_default")
+
+// The `k` nearest live elements whose label `keep` accepts.
+//
+// The predicate is a NAMED FUNCTION rather than a closure, and it
+// takes the label rather than the element: a caller filtering by
+// tenant, by permission or by recency has that in a table of its own,
+// keyed by the id it gave this index.
+//
+// The filter is applied during the descent and not after it, which is
+// what makes it useful: filtering afterwards over a `k` of 10 gives
+// fewer than 10 results whenever the filter is at all selective, and
+// the usual workaround — ask for 10 times as many — costs ten times as
+// much and still has no bound.  Applied during the descent, `ef` is
+// the budget and the result is `k` long whenever `k` live matching
+// elements are reachable.
+//
+// What it cannot promise: a filter that accepts almost nothing turns
+// the search into a walk of the graph, because the candidate list
+// fills with elements the filter rejects.  `HnswEmptyIndex` is not
+// what comes back then — a short result is — and a caller whose
+// filters are that selective wants one index per partition instead.
+pub fn search_filtered(ix: HnswIndex, query: [Float], k: Int, ef: Int,
+                       keep: fn(Int) -> Bool) -> Result<[HnswHit], HnswFault>
+    todo("hnsw-nv.hnswsearch.search_filtered")
+
+// The greedy best-first walk over ONE level, from one entry point,
+// keeping `ef` candidates.
+//
+// The algorithm's only real routine, and the whole of HNSW: `search`
+// is this run with `ef = 1` from the top level down to level 1, and
+// then once at level 0 with the caller's `ef`.  Public because a
+// caller doing something the top-level API does not cover needs this
+// rather than a reimplementation — a two-stage re-rank, a recall
+// harness that wants candidates rather than answers, a sharded search
+// that merges the candidate lists itself.
+//
+// Answers candidates sorted nearest first, deleted elements INCLUDED —
+// they are hops and this is the hop-level routine.  `search` is where
+// the marks are filtered out, because that is where "a result" starts
+// to mean something.
+pub fn search_layer(ix: HnswIndex, query: [Float], entry: Int, ef: Int,
+                    level: Int) -> Result<[HnswCandidate], HnswFault>
+    todo("hnsw-nv.hnswsearch.search_layer")
+
+// The nearest single element on a level, walking greedily from an
+// entry point.
+//
+// `search_layer` with `ef = 1`, which is what the descent through the
+// upper levels does.  Named because it is the shape a caller
+// implementing its own descent writes, and because `ef = 1` reads as a
+// magic number at a call site.
+pub fn greedy_step(ix: HnswIndex, query: [Float], entry: Int, level: Int) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswsearch.greedy_step")
+
+// The exact `k` nearest, by comparing the query with every live
+// element.
+//
+// No graph, no `ef`, no approximation: the answer HNSW is trying to
+// approximate.  Linear in the index's size, so it is not for serving —
+// it is for the two places an exact answer is what is wanted: a recall
+// measurement, and an index small enough that the graph is not worth
+// descending.  `recall_at` takes this and a `search` result
+// and gives the number.
+pub fn brute_force(ix: HnswIndex, query: [Float], k: Int) -> Result<[HnswHit], HnswFault>
+    todo("hnsw-nv.hnswsearch.brute_force")
+
+// The distance from a query to one labelled element.
+//
+// For a caller that has a result set from somewhere else — a keyword
+// search, a previous query, a cache — and wants the index's own
+// arithmetic over it rather than its own reimplementation of the
+// metric.
+pub fn distance_to(ix: HnswIndex, query: [Float], label: Int) -> Result<Float, HnswFault>
+    todo("hnsw-nv.hnswsearch.distance_to")
+
+// The fraction of an exact result the approximate one found.
+//
+// `|approx ∩ exact| / |exact|`, by label, which is what "recall@k"
+// means everywhere it is quoted.  1.0 when the approximate search
+// found every one of them, and 0.0 for an empty exact set — an
+// undefined ratio reported as the least flattering number, because
+// the alternative is a harness that reports perfect recall over a
+// query that matched nothing.
+//
+// The measurement this whole structure exists to trade against, and
+// the reason `brute_force` is public.  A caller tuning `ef` runs both
+// over a sample of real queries and reads the curve.
+//
+// ```novo
+// use hnswsearch
+//
+// fn main() [io]
+//     println("${hnswsearch.recall_at([], [])}")
+//     // : 0
+// ```
+pub fn recall_at(approx: [HnswHit], exact: [HnswHit]) -> Float
+    todo("hnsw-nv.hnswsearch.recall_at")
+
+// The labels of a result set, in order.
+//
+// For a caller joining the answers back to its own records, and for
+// `recall_at`'s own comparison.  Named because "map the label out of
+// each hit" is written at every call site otherwise.
+pub fn hit_labels(hits: [HnswHit]) -> [Int]
+    todo("hnsw-nv.hnswsearch.hit_labels")
+
+// How many distance computations a search of this index with this `ef`
+// is expected to make.
+//
+// The cost model, so that a caller choosing `ef` can see the shape of
+// the trade before it measures rather than after.  An estimate from
+// the index's own level histogram and degrees — not a measurement, and
+// the README says what it leaves out.
+pub fn expected_comparisons(ix: HnswIndex, ef: Int) -> Float
+    todo("hnsw-nv.hnswsearch.expected_comparisons")

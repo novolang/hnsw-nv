@@ -1,0 +1,190 @@
+// hnswparam.nv — the build parameters, and the one piece of arithmetic
+// the layer moved out of the index and into the caller's hands.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LEVEL MULTIPLIER, AND WHY IT IS THE INTERESTING NUMBER.  HNSW is
+// a stack of graphs: level 0 holds everything, and each level above
+// holds a geometrically thinning sample, so a search starts at the top
+// with a handful of elements and descends.  How thin is `mL`, the level
+// multiplier, and the level an element goes in at is
+//
+//     level = floor(-ln(u) * mL)        with u uniform in [0, 1)
+//
+// The paper's recommendation is `mL = 1 / ln(M)`, which makes the
+// expected number of levels `ln(N) / ln(M)` and the expected work per
+// query logarithmic.  `default_level_multiplier` is that, and
+// `level_of` is the formula, PUBLIC, because in this package the
+// uniform comes from the caller and a caller that wants to see what
+// its uniform bought should be able to.
+//
+// WHY THE UNIFORM IS A PARAMETER AT ALL.  rand-nv is `host` — the
+// entropy comes from the machine — and a `core` package may not depend
+// on a `host` one.  So `hnswgraph.insert` takes one number in [0, 1)
+// and this module turns it into a level.  A caller with an RNG passes
+// `rng.next_float()`; a caller rebuilding an index passes the levels it
+// recorded; a test passes a list it wrote down.
+//
+// The layer took something and gave something back.  It took the
+// convenience of an index that seeds itself.  It gave reproducibility:
+// the same uniforms build the same graph on every machine, which is
+// what makes a serialised index comparable with the one that produced
+// it and what makes a recall regression a thing you can bisect.
+//
+// EVERY BOUND BELOW IS A BOUND FOR A REASON, and the reason is on the
+// function rather than in a table somewhere.
+
+// What an index was built with.
+//
+// Fixed at construction and serialised with the index, because every
+// one of them shaped the graph: an index searched under different
+// parameters from the ones it was built under answers, and answers
+// worse, with nothing to say it is doing so.
+//
+// ```novo
+// use hnswparam
+//
+// fn main() [io]
+//     match hnswparam.params(768, HnswCosine, 16, 200, 10000)
+//         Ok(p)  => println("${p.m}")
+//         Err(f) => println(f.message())
+// ```
+pub struct HnswParams
+    // How many numbers a vector has.  Every vector handed to this
+    // index must have exactly this many.
+    dim: Int
+    // Which distance the graph was built under.
+    metric: HnswMetric
+    // The number of bidirectional links per element per level above
+    // zero.  The memory/recall knob: 16 is hnswlib's default, 8 is
+    // thin and fast, 64 is what a high-recall index over a hard
+    // dataset wants.
+    m: Int
+    // The candidate-list size during construction.  Larger builds a
+    // better graph and takes longer; it does not change the index's
+    // size.  200 is hnswlib's default.
+    ef_construction: Int
+    // How many elements the index was sized for.  Not a hard ceiling
+    // on the design — `hnswgraph.grow` raises it — but the number an
+    // insert past which is `HnswAtCapacity`, because an index that
+    // silently reallocated would hide the cost of having sized it
+    // wrong.
+    capacity: Int
+    // `mL` in the paper: the level multiplier.  `level_of` is where it
+    // is used.  A field rather than a constant so that an index
+    // serialised today reads back at the multiplier it was built
+    // with, whatever this package's default becomes.
+    level_multiplier: Float
+
+// Parameters, checked.
+//
+// `HnswBadParam` naming the field for: a dimension below 1; an `m`
+// outside `2 ..= 128`; an `ef_construction` below `m`; a capacity
+// below 1.  The level multiplier is `default_level_multiplier(m)`;
+// `with_level_multiplier` overrides it.
+pub fn params(dim: Int, metric: HnswMetric, m: Int, ef_construction: Int,
+              capacity: Int) -> Result<HnswParams, HnswFault>
+    todo("hnsw-nv.hnswparam.params")
+
+// hnswlib's defaults for this dimension and metric: M 16,
+// ef_construction 200, capacity 1024.
+//
+// The parameters to start from, and the ones a benchmark should be
+// read against.  A caller tuning an index changes one at a time from
+// here.
+pub fn default_params(dim: Int, metric: HnswMetric) -> Result<HnswParams, HnswFault>
+    todo("hnsw-nv.hnswparam.default_params")
+
+// The same parameters with a different level multiplier.
+//
+// `HnswBadParam` for a multiplier that is not positive and finite.
+// The knob almost nobody should touch: the paper's `1 / ln(M)` is
+// optimal for the search cost it analyses, and a larger one buys
+// deeper stacks that cost more to descend than they save.
+pub fn with_level_multiplier(p: HnswParams, ml: Float) -> Result<HnswParams, HnswFault>
+    todo("hnsw-nv.hnswparam.with_level_multiplier")
+
+// The same parameters with a larger capacity.
+//
+// `HnswBadParam` for a capacity below the one it already has —
+// shrinking would have to decide which elements to drop, and that is
+// not a decision an index should make on a caller's behalf.
+pub fn with_capacity(p: HnswParams, capacity: Int) -> Result<HnswParams, HnswFault>
+    todo("hnsw-nv.hnswparam.with_capacity")
+
+// `1 / ln(M)`, the paper's recommendation.
+//
+// ```novo
+// use hnswparam
+//
+// fn main() [io]
+//     println("${hnswparam.default_level_multiplier(16) > 0.0}")
+//     // : true
+// ```
+pub fn default_level_multiplier(m: Int) -> Float
+    todo("hnsw-nv.hnswparam.default_level_multiplier")
+
+// The level a uniform buys: `floor(-ln(u) * ml)`.
+//
+// `HnswBadUniform` for a `u` outside [0, 1) — including exactly 1.0,
+// whose logarithm is zero and which would put every element on level
+// 0, and 0.0, whose logarithm is not finite.  A caller drawing from
+// rand-nv's `next_float` gets [0, 1) and never meets either.
+//
+// The distribution this produces: level 0 with probability
+// `1 - 1/M`, level 1 with `(1/M)(1 - 1/M)`, and so on — so in an index
+// of a million elements at M 16, about sixty thousand reach level 1,
+// four thousand level 2, and a handful the top.
+//
+// ```novo
+// use hnswparam
+//
+// fn main() [io]
+//     match hnswparam.level_of(0.5, 0.36)
+//         Ok(l)  => println("${l >= 0}")
+//                   // : true
+//         Err(f) => println(f.message())
+// ```
+pub fn level_of(u: Float, ml: Float) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswparam.level_of")
+
+// How many links an element may hold at this level.
+//
+// `2 * M` at level 0 and `M` above it.  Level 0 is wider because it
+// holds every element and is the only level a query's final candidate
+// list is drawn from, so its connectivity is what recall is made of —
+// hnswlib calls the number `maxM0` and defaults it to exactly this.
+pub fn max_links(p: HnswParams, level: Int) -> Int
+    todo("hnsw-nv.hnswparam.max_links")
+
+// The `ef` a search uses when the caller does not choose one:
+// `max(k, ef_construction / 4)`, and never below k.
+//
+// A default rather than a requirement, because `ef` is the one knob a
+// caller turns per query rather than per index: it trades latency for
+// recall and the right value depends on what the query is for.
+pub fn default_ef(p: HnswParams, k: Int) -> Int
+    todo("hnsw-nv.hnswparam.default_ef")
+
+// How many bytes one element costs: its vector, its links at every
+// level it occupies, its label and its mark.
+//
+// `level` is the element's own, because an element at level 3 carries
+// four link arrays.  What a caller sizing an index before it builds
+// one wants, and what makes the cost of `M` visible: at 768
+// dimensions and M 16, the vector is 6,144 bytes and the level-0 links
+// are 256, so M is under five per cent — and at 64 dimensions it is
+// half the index.
+pub fn element_bytes(p: HnswParams, level: Int) -> Int
+    todo("hnsw-nv.hnswparam.element_bytes")
+
+// The expected number of elements at or above a level, for an index of
+// `count` elements.
+//
+// `count * (1/M)^level`, which is the geometric thinning the level
+// multiplier produces.  For a caller checking that a build looks like
+// a build: an index whose level histogram is nothing like this was
+// fed uniforms that are not uniform, and the usual cause is a caller
+// passing a counter where it meant to pass a draw.
+pub fn expected_at_level(p: HnswParams, count: Int, level: Int) -> Float
+    todo("hnsw-nv.hnswparam.expected_at_level")

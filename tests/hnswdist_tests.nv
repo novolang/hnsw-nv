@@ -1,0 +1,302 @@
+// hnswdist_tests.nv — the API suite for the three distances and the
+// build parameters: the sign convention, the squared L2, the level
+// formula, and the bounds every parameter is checked against.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: hnsw-nv.<module>.<fn>`.
+//
+// WHERE THE NUMBERS COME FROM.  The distances are arithmetic and the
+// suite computes them by hand: `[0, 0]` to `[3, 4]` is the 3-4-5
+// triangle, so the squared L2 is 25 and the L2 is 5; `[1, 0]` against
+// `[0, 1]`, `[1, 0]` and `[-1, 0]` gives the three corners of cosine's
+// range; `[1, 2, 3]` against `[4, 5, 6]` is 32, which is the dot
+// product every textbook uses.
+//
+// The level formula is the paper's — Malkov and Yashunin, algorithm 1,
+// `l = floor(-ln(unif(0,1)) * mL)` — with `mL = 1 / ln(M)`, which is
+// the same paper's recommendation and hnswlib's default.  At M 16 that
+// multiplier is 0.36067, and the four uniforms below were chosen to
+// land one in each of the first four levels.
+//
+// THE REFERENCE IMPLEMENTATION IS THE ORACLE for the parts that are not
+// arithmetic, and it arrives beside this file as a generated run when
+// the bodies land: hnswlib built over the same vectors with the same
+// parameters and the same recorded level sequence, its graph compared
+// with this one's edge for edge, and its recall compared on the SIFT
+// and GIST query sets.
+
+use std.test
+use hnswdist
+use hnswparam
+use hnswerr
+
+@test
+fn test_everything_here_is_a_distance_and_smaller_is_nearer() [io]
+    test.case("squared L2 is the sum of the squared differences")
+    match hnswdist.l2_squared([0.0, 0.0], [3.0, 4.0])
+        Ok(d)  => test.assert_approx(d, 25.0, 0.000001)
+        Err(f) => test.fail(f.message())
+
+    test.case("and the unsquared one is there for a caller reporting it")
+    match hnswdist.l2([0.0, 0.0], [3.0, 4.0])
+        Ok(d)  => test.assert_approx(d, 5.0, 0.000001)
+        Err(f) => test.fail(f.message())
+
+    test.case("cosine distance runs from zero to two")
+    // Identical, orthogonal, opposite.  The sign convention: zero is
+    // nearest, because every comparison in the package is a minimum.
+    match hnswdist.cosine([1.0, 0.0], [1.0, 0.0])
+        Ok(d)  => test.assert_approx(d, 0.0, 0.000001)
+        Err(f) => test.fail(f.message())
+    match hnswdist.cosine([1.0, 0.0], [0.0, 1.0])
+        Ok(d)  => test.assert_approx(d, 1.0, 0.000001)
+        Err(f) => test.fail(f.message())
+    match hnswdist.cosine([1.0, 0.0], [-1.0, 0.0])
+        Ok(d)  => test.assert_approx(d, 2.0, 0.000001)
+        Err(f) => test.fail(f.message())
+
+    test.case("the dot product is the textbook one")
+    match hnswdist.dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0])
+        Ok(d)  => test.assert_approx(d, 32.0, 0.000001)
+        Err(f) => test.fail(f.message())
+
+    test.case("and inner-product DISTANCE is one minus it, so it may be negative")
+    // -31, and that is not a bug.  An inner-product index over
+    // unnormalised vectors has distances below zero and does not obey
+    // the triangle inequality; hnswlib makes the same choice, and the
+    // README says what it costs.
+    match hnswdist.inner([1.0, 2.0, 3.0], [4.0, 5.0, 6.0])
+        Ok(d)  => test.assert_approx(d, -31.0, 0.000001)
+        Err(f) => test.fail(f.message())
+
+    test.case("for unit vectors the inner-product and cosine distances agree")
+    match hnswdist.inner([1.0, 0.0], [0.0, 1.0])
+        Ok(a)  =>
+            match hnswdist.cosine([1.0, 0.0], [0.0, 1.0])
+                Ok(b)  => test.assert_approx(a, b, 0.000001)
+                Err(f) => test.fail(f.message())
+        Err(f) => test.fail(f.message())
+
+    test.case("and the metric enum dispatches to the same arithmetic")
+    match hnswdist.distance(HnswL2, [0.0, 0.0], [3.0, 4.0])
+        Ok(d)  => test.assert_approx(d, 25.0, 0.000001)
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_a_vector_that_cannot_be_compared_is_refused_rather_than_stored() [io]
+    test.case("two vectors of different lengths name both lengths")
+    match hnswdist.l2_squared([1.0, 2.0], [1.0])
+        Ok(d)  => test.fail("a distance of ${d} between a pair and a single")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+
+    test.case("a zero vector has no cosine distance and is not given one")
+    // 0.0 would make it maximally similar to everything and 1.0
+    // maximally distant; both are wrong in a way that shows up as bad
+    // results rather than as an error.
+    match hnswdist.cosine([0.0, 0.0], [1.0, 0.0])
+        Ok(d)  => test.fail("a zero vector at cosine distance ${d}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("but a zero vector has a perfectly good L2 distance")
+    match hnswdist.l2_squared([0.0, 0.0], [1.0, 0.0])
+        Ok(d)  => test.assert_approx(d, 1.0, 0.000001)
+        Err(f) => test.fail(f.message())
+
+    test.case("the finite check is available before a batch goes in")
+    test.assert(hnswdist.is_finite_vector([1.0, 2.0, 3.0]))
+
+    test.case("a norm is the Euclidean length and normalising divides by it")
+    match hnswdist.norm([3.0, 4.0])
+        Ok(n)  => test.assert_approx(n, 5.0, 0.000001)
+        Err(f) => test.fail(f.message())
+    match hnswdist.normalize([3.0, 4.0])
+        Err(f) => test.fail(f.message())
+        Ok(v)  =>
+            test.assert(list.len(v) == 2)
+            test.assert_approx(v[0], 0.6, 0.000001)
+            test.assert_approx(v[1], 0.8, 0.000001)
+
+    test.case("and a zero vector cannot be normalised either")
+    match hnswdist.normalize([0.0, 0.0])
+        Ok(v)  => test.fail("a zero vector normalised to ${list.len(v)} coordinate(s)")
+        Err(f) => test.assert(f.message() != "")
+
+@test
+fn test_the_metric_travels_with_the_index_as_a_name_and_a_code() [io]
+    test.case("each metric has a lower-case name")
+    test.assert(hnswdist.metric_name(HnswL2) == "l2")
+    test.assert(hnswdist.metric_name(HnswCosine) == "cosine")
+    test.assert(hnswdist.metric_name(HnswInner) == "inner")
+
+    test.case("and a code, and both round-trip")
+    test.assert(hnswdist.metric_code(HnswL2) == 0)
+    test.assert(hnswdist.metric_code(HnswCosine) == 1)
+    test.assert(hnswdist.metric_code(HnswInner) == 2)
+    match hnswdist.metric_of_code(1)
+        Ok(m)  => test.assert(hnswdist.metric_name(m) == "cosine")
+        Err(f) => test.fail(f.message())
+    match hnswdist.metric_of_name("inner")
+        Some(m) => test.assert(hnswdist.metric_code(m) == 2)
+        None    => test.fail("inner parsed as nothing")
+
+    test.case("a code that is not a metric is refused rather than defaulted")
+    match hnswdist.metric_of_code(9)
+        Ok(m)  => test.fail("9 named ${hnswdist.metric_name(m)}")
+        Err(f) => test.assert(f.message() != "")
+    test.assert_none(hnswdist.metric_of_name("euclidean"))
+
+    test.case("two of the three want their vectors normalised and say so")
+    // The commonest way to get poor results out of a vector index is
+    // to build it with an inner-product metric over vectors nobody
+    // normalised, so the package will at least say which ones care.
+    test.assert(hnswdist.wants_normalized(HnswCosine))
+    test.assert(hnswdist.wants_normalized(HnswInner))
+    test.assert(hnswdist.wants_normalized(HnswL2) == false)
+
+@test
+fn test_the_level_formula_is_the_papers_and_the_uniform_is_the_callers() [io]
+    test.case("the multiplier is one over the natural log of M")
+    // ln 16 is 2.7726, so mL is 0.36067.
+    test.assert_approx(hnswparam.default_level_multiplier(16), 0.36067, 0.0001)
+
+    test.case("and floor(-ln(u) * mL) is the level")
+    // -ln(0.5) is 0.6931; times 0.36067 is 0.2500, which floors to 0.
+    match hnswparam.level_of(0.5, 0.36067)
+        Ok(l)  => test.assert(l == 0)
+        Err(f) => test.fail(f.message())
+    // -ln(0.05) is 2.9957; times 0.36067 is 1.0804 → 1.
+    match hnswparam.level_of(0.05, 0.36067)
+        Ok(l)  => test.assert(l == 1)
+        Err(f) => test.fail(f.message())
+    // -ln(0.001) is 6.9078; times 0.36067 is 2.4913 → 2.
+    match hnswparam.level_of(0.001, 0.36067)
+        Ok(l)  => test.assert(l == 2)
+        Err(f) => test.fail(f.message())
+    // -ln(0.0001) is 9.2103; times 0.36067 is 3.3218 → 3.
+    match hnswparam.level_of(0.0001, 0.36067)
+        Ok(l)  => test.assert(l == 3)
+        Err(f) => test.fail(f.message())
+
+    test.case("a uniform outside [0, 1) is a fault and never a clamp")
+    // A clamped 1.0 puts every element on level 0, and an index built
+    // that way is a linked list that answers every query by scanning
+    // it — a failure with no symptom but latency.
+    match hnswparam.level_of(1.0, 0.36067)
+        Ok(l)  => test.fail("a uniform of 1.0 bought level ${l}")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+    match hnswparam.level_of(-0.1, 0.36067)
+        Ok(l)  => test.fail("a uniform of -0.1 bought level ${l}")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+    match hnswparam.level_of(0.0, 0.36067)
+        Ok(l)  => test.fail("a uniform of 0.0 bought level ${l}")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+
+@test
+fn test_every_build_parameter_has_a_bound_and_the_fault_names_it() [io]
+    test.case("the defaults are hnswlib's")
+    match hnswparam.default_params(768, HnswCosine)
+        Err(f) => test.fail(f.message())
+        Ok(p)  =>
+            test.assert(p.dim == 768)
+            test.assert(p.m == 16)
+            test.assert(p.ef_construction == 200)
+            test.assert(p.capacity == 1024)
+            test.assert_approx(p.level_multiplier, 0.36067, 0.0001)
+
+    test.case("a dimension below one describes no vector")
+    match hnswparam.params(0, HnswL2, 16, 200, 100)
+        Ok(p)  => test.fail("an index of ${p.dim} dimension(s)")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+
+    test.case("M has a range and 128 is the top of it")
+    match hnswparam.params(4, HnswL2, 1, 200, 100)
+        Ok(p)  => test.fail("an index at M ${p.m}")
+        Err(f) => test.assert(f.message() != "")
+    match hnswparam.params(4, HnswL2, 200, 400, 100)
+        Ok(p)  => test.fail("an index at M ${p.m}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("ef_construction below M builds a graph that cannot reach M links")
+    match hnswparam.params(4, HnswL2, 16, 8, 100)
+        Ok(p)  => test.fail("an index at ef_construction ${p.ef_construction}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("and a capacity below one holds nothing")
+    match hnswparam.params(4, HnswL2, 16, 200, 0)
+        Ok(p)  => test.fail("an index of capacity ${p.capacity}")
+        Err(f) => test.assert(f.message() != "")
+
+@test
+fn test_level_zero_is_twice_as_wide_as_every_level_above_it() [io]
+    match hnswparam.default_params(4, HnswL2)
+        Err(f) => test.fail(f.message())
+        Ok(p)  =>
+            test.case("level 0 holds 2M links and the rest hold M")
+            // Level 0 holds every element and is the only level a
+            // query's final candidate list is drawn from, so its
+            // connectivity is what recall is made of.  hnswlib calls
+            // the number maxM0 and defaults it to exactly this.
+            test.assert(hnswparam.max_links(p, 0) == 32)
+            test.assert(hnswparam.max_links(p, 1) == 16)
+            test.assert(hnswparam.max_links(p, 7) == 16)
+
+            test.case("the default ef is never below k")
+            test.assert(hnswparam.default_ef(p, 10) >= 10)
+            test.assert(hnswparam.default_ef(p, 1000) >= 1000)
+
+            test.case("an element's cost is its vector plus its links")
+            // At four dimensions the links dominate; at 768 they are
+            // under five per cent.  The point of publishing the number
+            // is that a caller can see which regime it is in.
+            test.assert(hnswparam.element_bytes(p, 0) > 0)
+            test.assert(hnswparam.element_bytes(p, 2) > hnswparam.element_bytes(p, 0))
+
+            test.case("the expected level histogram is geometric in 1/M")
+            // A build whose histogram is nothing like this was fed
+            // uniforms that are not uniform.
+            test.assert_approx(hnswparam.expected_at_level(p, 16000, 0), 16000.0, 1.0)
+            test.assert_approx(hnswparam.expected_at_level(p, 16000, 1), 1000.0, 1.0)
+            test.assert_approx(hnswparam.expected_at_level(p, 16000, 2), 62.5, 1.0)
+
+            test.case("capacity grows and never shrinks")
+            match hnswparam.with_capacity(p, 4096)
+                Ok(q)  => test.assert(q.capacity == 4096)
+                Err(f) => test.fail(f.message())
+            match hnswparam.with_capacity(p, 16)
+                Ok(q)  => test.fail("a capacity shrunk to ${q.capacity}")
+                Err(f) => test.assert(f.message() != "")
+
+            test.case("and the multiplier can be overridden, for the caller who has measured")
+            match hnswparam.with_level_multiplier(p, 0.5)
+                Ok(q)  => test.assert_approx(q.level_multiplier, 0.5, 0.000001)
+                Err(f) => test.fail(f.message())
+            match hnswparam.with_level_multiplier(p, 0.0)
+                Ok(q)  => test.fail("a multiplier of ${q.level_multiplier}")
+                Err(f) => test.assert(f.message() != "")
+
+@test
+fn test_a_fault_says_which_of_the_three_kinds_it_is() [io]
+    test.case("a parameter or a vector the caller chose is a usage fault")
+    test.assert(hnswerr.is_usage(HnswBadParam("M", 1)))
+    test.assert(hnswerr.is_usage(HnswDimMismatch(768, 384)))
+    test.assert(hnswerr.is_usage(HnswDuplicateLabel(7)))
+
+    test.case("an ordinary answer and a sizing decision are not")
+    test.assert(hnswerr.is_usage(HnswEmptyIndex) == false)
+    test.assert(hnswerr.is_usage(HnswNoSuchLabel(7)) == false)
+    test.assert(hnswerr.is_usage(HnswOutputFull(1024, 16)) == false)
+
+    test.case("and the four format faults are told apart from everything else")
+    // A cache that fails this way is a cache to discard; anything
+    // else is a bug to report.
+    test.assert(hnswerr.is_format(HnswBadMagic(0)))
+    test.assert(hnswerr.is_format(HnswBadVersion(9)))
+    test.assert(hnswerr.is_format(HnswTruncated(48, 16)))
+    test.assert(hnswerr.is_format(HnswCorruptGraph("neighbour", 3)))
+    test.assert(hnswerr.is_format(HnswDimMismatch(768, 384)) == false)
+
+    test.case("every fault says something")
+    test.assert(HnswZeroNorm.message() != "")
+    test.assert(HnswAtCapacity(1024).message() != "")
+    test.assert(HnswNotFinite(3).message() != "")
+    test.assert(HnswBadUniform(1.0).message() != "")

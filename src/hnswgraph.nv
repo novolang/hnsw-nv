@@ -1,0 +1,307 @@
+// hnswgraph.nv — the index itself: a value holding every vector, every
+// link and nothing else.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOAD-BEARING INTERFACE OF THE PACKAGE IS THIS SIGNATURE:
+//
+//     pub fn insert(ix: HnswIndex, label: Int, v: [Float], u: Float)
+//         -> Result<HnswIndex, HnswFault>
+//
+// `u` is one uniform in [0, 1), and it is the whole of the randomness
+// HNSW needs.  hnswlib holds a `std::mt19937` inside the index and
+// draws from it; this package cannot, because rand-nv is `host` and a
+// `core` package may not reach a `host` one.  So the draw is the
+// caller's and the arithmetic is the index's: `hnswparam.level_of`
+// turns `u` into the level this element goes in at, and everything
+// else about the insert is deterministic.
+//
+// That constraint is the design.  An index built from a recorded list
+// of uniforms rebuilds byte for byte, on any machine, in any process —
+// which is what makes a serialised index comparable with the one that
+// produced it, and what turns "recall dropped after that change" from
+// an argument into a bisect.
+//
+// AN INDEX IS A VALUE AND COPYING ONE IS A COPY.  Every function here
+// takes an index and returns one; nothing mutates.  That is not a
+// stylistic choice, it is what a `core` package with no interior
+// mutability can offer — and it has one real consequence a caller
+// should size before it starts: an insert copies the index.  The
+// implementation's job is to make that a Perceus in-place update when
+// the caller holds the only reference, which is what
+// `var ix = ...; ix = insert(ix, ...)!` in a loop gives it.  A caller
+// that keeps the old index around gets a real copy, and that is the
+// honest price of being able to.
+//
+// HOW THE LINKS ARE STORED, because the field is public and a reader
+// should be able to check the arithmetic.  `links` is one flat list.
+// Element `i` owns a run of `stride` slots starting at `i * stride`,
+// where `stride` is `max_links(0) + max_links(1) * (top_level_cap)` —
+// `link_base` computes the offset of one (element, level) pair and
+// `link_counts` says how many of its slots are used.  A neighbour is
+// the INDEX of an element, not its label: labels are the caller's and
+// may be any integers at all, and a graph addressed by them would
+// need a map on every hop.
+//
+// ONE SLOT PER ELEMENT, AND DELETION DOES NOT REMOVE IT.  `mark_deleted`
+// sets a flag; the vector stays, its links stay, and searches skip it
+// as a RESULT while still walking THROUGH it.  That is hnswlib's
+// behaviour and it is not a shortcut: removing an element would cut
+// the graph, and repairing the cut means re-running the neighbour
+// selection for everything that pointed at it — at which point a
+// rebuild is cheaper.  `insert_replacing` is what reclaims the slot.
+
+// An HNSW index.
+//
+// The fields are public because a value with nothing hidden is one a
+// reader of this package can check, and because a tool inspecting an
+// index — a level histogram, a degree distribution, a recall harness —
+// should not need this package to grow an accessor per question.
+//
+// ```novo
+// use hnswgraph
+// use hnswparam
+//
+// fn main() [io]
+//     match hnswparam.default_params(4, HnswL2)
+//         Err(f) => println(f.message())
+//         Ok(p)  => println("${hnswgraph.count(hnswgraph.index(p))}")
+//                   // : 0
+// ```
+pub struct HnswIndex
+    // What the index was built with.  Never changes after
+    // construction except through `grow`.
+    params: HnswParams
+    // Every vector, row-major and packed: element `i` occupies
+    // `data[i * dim ..< (i + 1) * dim]`.  One buffer rather than a
+    // list of lists, because the distance loop is the whole cost of
+    // this structure and it wants two contiguous runs.
+    data: [Float]
+    // The caller's own id per element, in slot order.
+    labels: [Int]
+    // The mark per element.  A deleted element keeps its vector and
+    // its links; it is skipped as a result and walked through as a
+    // hop.
+    deleted: [Bool]
+    // The level each element was inserted at.  0 for most of them.
+    levels: [Int]
+    // The adjacency, flattened — see the module comment.  A neighbour
+    // is an element index, not a label.
+    links: [Int]
+    // How many of each (element, level) run's slots are used.
+    link_counts: [Int]
+    // Where a search starts: the index of an element on the top level.
+    // -1 for an empty index.
+    entry: Int
+    // The highest level any element occupies.  -1 for an empty index.
+    top_level: Int
+
+// An empty index with these parameters.
+pub fn index(p: HnswParams) -> HnswIndex
+    todo("hnsw-nv.hnswgraph.index")
+
+// How many elements the index holds, deleted ones included.
+//
+// The number that matters for memory.  `live_count` is the one that
+// matters for a search.
+pub fn count(ix: HnswIndex) -> Int
+    todo("hnsw-nv.hnswgraph.count")
+
+// How many elements a search can return: `count` minus the marks.
+pub fn live_count(ix: HnswIndex) -> Int
+    todo("hnsw-nv.hnswgraph.live_count")
+
+// How many elements are marked deleted.
+pub fn deleted_count(ix: HnswIndex) -> Int
+    todo("hnsw-nv.hnswgraph.deleted_count")
+
+// The parameters the index was built with.
+pub fn params_of(ix: HnswIndex) -> HnswParams
+    todo("hnsw-nv.hnswgraph.params_of")
+
+// Add an element, with the caller's uniform choosing its level.
+//
+// THE LOAD-BEARING SIGNATURE.  `u` is one number in [0, 1) —
+// `rng.next_float()` from rand-nv on a host, a recorded value on a
+// rebuild, a written-down list in a test — and `hnswparam.level_of`
+// turns it into the level.  Everything else is deterministic.
+//
+// `HnswDimMismatch` for a vector of the wrong length,
+// `HnswNotFinite` for one holding a value that is not a number,
+// `HnswZeroNorm` for a zero vector under cosine,
+// `HnswDuplicateLabel` for a label the index already holds,
+// `HnswBadUniform` for a `u` outside [0, 1), and
+// `HnswAtCapacity` when the index is full — `grow` or
+// `insert_replacing` is the answer to the last.
+//
+// ```novo
+// use hnswgraph
+// use hnswparam
+//
+// fn main() [io]
+//     match hnswparam.default_params(2, HnswL2)
+//         Err(f) => println(f.message())
+//         Ok(p)  =>
+//             match hnswgraph.insert(hnswgraph.index(p), 1, [0.0, 1.0], 0.5)
+//                 Ok(ix) => println("${hnswgraph.count(ix)}")
+//                           // : 1
+//                 Err(f) => println(f.message())
+// ```
+pub fn insert(ix: HnswIndex, label: Int, v: [Float], u: Float) -> Result<HnswIndex, HnswFault>
+    todo("hnsw-nv.hnswgraph.insert")
+
+// Add an element at a level the caller states outright.
+//
+// The half of `insert` with no randomness in it at all, for the two
+// callers that have the level rather than a draw: a rebuild from a
+// serialised index, and a test that wants a graph of a known shape.
+// `HnswBadParam` for a negative level.
+//
+// `insert` is this function with `hnswparam.level_of` in front of it,
+// and both are public so that neither caller has to pretend to be the
+// other.
+pub fn insert_at_level(ix: HnswIndex, label: Int, v: [Float],
+                       level: Int) -> Result<HnswIndex, HnswFault>
+    todo("hnsw-nv.hnswgraph.insert_at_level")
+
+// Add an element into a slot a deleted one is holding, or as a new one
+// when there is none.
+//
+// How a long-running index reclaims space without a rebuild.  The slot
+// it takes is the deleted element's, links and all — so the new
+// element inherits the old one's neighbours as a starting point and is
+// then re-linked properly, which is what hnswlib's
+// `replace_deleted` does and why it is cheaper than an insert plus a
+// compaction.
+//
+// The graph it produces is NOT the graph a fresh build of the same
+// elements produces, and this package says so rather than implying
+// otherwise: an index that has replaced a large fraction of its
+// elements has drifted, and `drift` is what says by how much.
+pub fn insert_replacing(ix: HnswIndex, label: Int, v: [Float],
+                        u: Float) -> Result<HnswIndex, HnswFault>
+    todo("hnsw-nv.hnswgraph.insert_replacing")
+
+// Mark an element deleted.
+//
+// It keeps its vector and its links.  Searches skip it as a result and
+// walk through it as a hop — see the module comment for why removing
+// it outright is not on offer.  `HnswNoSuchLabel` when nothing carries
+// the label.
+pub fn mark_deleted(ix: HnswIndex, label: Int) -> Result<HnswIndex, HnswFault>
+    todo("hnsw-nv.hnswgraph.mark_deleted")
+
+// Clear an element's mark.
+//
+// Free, because nothing was thrown away.  `HnswNoSuchLabel` when
+// nothing carries the label; marking an element that is already marked
+// or clearing one that is not is not a fault, because a caller
+// reconciling a batch should not have to know which it is doing.
+pub fn unmark_deleted(ix: HnswIndex, label: Int) -> Result<HnswIndex, HnswFault>
+    todo("hnsw-nv.hnswgraph.unmark_deleted")
+
+// Whether the element with this label is marked.
+pub fn is_deleted(ix: HnswIndex, label: Int) -> Result<Bool, HnswFault>
+    todo("hnsw-nv.hnswgraph.is_deleted")
+
+// Raise the capacity.
+//
+// `hnswparam.with_capacity` on the parameters and room for the
+// elements.  Explicit rather than automatic, because an index that
+// silently reallocated would hide the cost of having sized it wrong,
+// and because the copy is the expensive thing this structure does.
+pub fn grow(ix: HnswIndex, capacity: Int) -> Result<HnswIndex, HnswFault>
+    todo("hnsw-nv.hnswgraph.grow")
+
+// The slot an element's label occupies, or `None`.
+//
+// A walk today.  The implementation may add a map, and the signature
+// does not change when it does — which is why every other function
+// here takes a label and calls this rather than taking a slot.
+pub fn slot_of(ix: HnswIndex, label: Int) -> ?Int
+    todo("hnsw-nv.hnswgraph.slot_of")
+
+// The label in a slot.
+//
+// `HnswNoSuchLabel` for a slot out of range — the same fault, because
+// to a caller both failures are "that element is not here".
+pub fn label_at(ix: HnswIndex, slot: Int) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswgraph.label_at")
+
+// The vector stored under a label.
+//
+// A copy: novo-lang has no borrowing slice, and a `[Float]` out of the
+// flat buffer is a new list.  For a caller re-ranking a result set
+// this is the call, and for a caller doing it over thousands of rows
+// `vector_base` is the offset to walk `ix.data` from instead.
+pub fn vector_of(ix: HnswIndex, label: Int) -> Result<[Float], HnswFault>
+    todo("hnsw-nv.hnswgraph.vector_of")
+
+// Where an element's vector starts in `data`.
+//
+// `slot * dim`, and it is public so that a caller walking many vectors
+// can index `ix.data` directly rather than copying each one out.  The
+// arithmetic is one multiplication and having it named is what stops
+// four call sites writing it four ways.
+pub fn vector_base(ix: HnswIndex, slot: Int) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswgraph.vector_base")
+
+// The level an element was inserted at.
+pub fn level_of_label(ix: HnswIndex, label: Int) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswgraph.level_of_label")
+
+// Where an element's links at a level start in `links`.
+//
+// The offset the module comment describes, computed once.
+// `HnswBadParam` for a level above the element's own — an element at
+// level 1 has no links at level 2, and asking is a bug rather than an
+// empty answer.
+pub fn link_base(ix: HnswIndex, slot: Int, level: Int) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswgraph.link_base")
+
+// An element's neighbours at a level, as element indices.
+//
+// Indices and not labels, because that is what the graph stores and
+// converting would cost a lookup per hop.  `label_at` is the
+// conversion when a caller wants one.
+pub fn neighbours(ix: HnswIndex, slot: Int, level: Int) -> Result<[Int], HnswFault>
+    todo("hnsw-nv.hnswgraph.neighbours")
+
+// How many neighbours an element has at a level.
+pub fn degree(ix: HnswIndex, slot: Int, level: Int) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswgraph.degree")
+
+// How many elements sit at or above each level, lowest first.
+//
+// The shape of the stack, and the first thing to look at when an index
+// answers badly: a histogram that is not geometric was built from
+// uniforms that are not uniform, and the usual cause is a caller
+// passing a counter where it meant a draw.
+// `hnswparam.expected_at_level` is what to compare it with.
+pub fn level_histogram(ix: HnswIndex) -> [Int]
+    todo("hnsw-nv.hnswgraph.level_histogram")
+
+// Check the graph against itself.
+//
+// `HnswCorruptGraph` naming the first thing that does not hold: a
+// neighbour index off the end, a level above the top, a link count
+// above `hnswparam.max_links`, an entry point that is not on the top
+// level, a link that is not reciprocated where the algorithm requires
+// it to be.  Answers the number of links checked when everything
+// holds.
+//
+// What `hnswio.from_bytes` runs after it reads, and what a test runs
+// after a build.  A corrupt HNSW does not crash — it answers, worse —
+// so the check has to be explicit.
+pub fn check(ix: HnswIndex) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswgraph.check")
+
+// How far the index has drifted from a fresh build: the fraction of
+// its slots that have been replaced or marked.
+//
+// 0.0 for an index nothing has been deleted from.  A number rather
+// than advice, because when to rebuild depends on what the index is
+// for — but past about half, a fresh build is both smaller and better
+// connected, and the number is the input to that decision.
+pub fn drift(ix: HnswIndex) -> Float
+    todo("hnsw-nv.hnswgraph.drift")

@@ -1,0 +1,429 @@
+// hnswindex_tests.nv — the API suite for the index: insert with the
+// caller's uniform, the graph's own invariants, k-nearest search and
+// the `ef` contract, delete by mark, and the serialised form's round
+// trip.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: hnsw-nv.<module>.<fn>`.
+//
+// THE UNIFORMS ARE WRITTEN DOWN, and that is the point of the design
+// rather than a convenience for the suite.  rand-nv is `host` and this
+// package is `core`, so the draw is the caller's — which means a build
+// is a pure function of the vectors and the uniform sequence, and this
+// file is an example of the thing that buys: a graph that is the same
+// on every machine, every run, so an assertion about an edge is an
+// assertion and not a flake.
+//
+// THE REFERENCE IMPLEMENTATION IS THE ORACLE, and it arrives beside
+// this file as a generated run when the bodies land: hnswlib built over
+// the same vectors with the same parameters and the same level
+// sequence, edge for edge, and recall@10 over the SIFT1M and GIST1M
+// query sets compared at four values of `ef`.
+
+use std.test
+use std.bytes
+use hnswdist
+use hnswparam
+use hnswgraph
+use hnswsearch
+use hnswio
+use hnswerr
+
+// Four unit vectors on the axes of a two-dimensional plane, and the
+// uniforms that put the first on level 1 and the rest on level 0 — so
+// the graph has a top and a bottom and the descent has something to
+// descend.
+fn axes() -> [[Float]]
+    [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+
+fn uniforms() -> [Float]
+    [0.001, 0.5, 0.6, 0.7]
+
+// The four axes inserted into a fresh L2 index, labelled 10 through 13.
+fn built() -> Result<HnswIndex, HnswFault>
+    let p = hnswparam.params(2, HnswL2, 4, 16, 8)!
+    var ix = hnswgraph.index(p)
+    let vs = axes()
+    let us = uniforms()
+    for i in 0..4
+        ix = hnswgraph.insert(ix, 10 + i, vs[i], us[i])!
+    Ok(ix)
+
+@test
+fn test_an_insert_takes_one_uniform_and_the_rest_is_deterministic() [io]
+    test.case("an empty index holds nothing and has no entry point")
+    match hnswparam.default_params(2, HnswL2)
+        Err(f) => test.fail(f.message())
+        Ok(p)  =>
+            let e = hnswgraph.index(p)
+            test.assert(hnswgraph.count(e) == 0)
+            test.assert(hnswgraph.live_count(e) == 0)
+            test.assert(hnswgraph.deleted_count(e) == 0)
+            test.assert(e.entry == -1)
+            test.assert(e.top_level == -1)
+            test.assert(hnswgraph.params_of(e).dim == 2)
+
+    test.case("four inserts put four elements in")
+    match built()
+        Err(f) => test.fail(f.message())
+        Ok(ix) =>
+            test.assert(hnswgraph.count(ix) == 4)
+            test.assert(hnswgraph.live_count(ix) == 4)
+
+            test.case("the first one's uniform put it on a level above zero")
+            // -ln(0.001) * (1 / ln 4) is 4.98, so label 10 is high up
+            // and is the entry point; the other three floor to 0.
+            match hnswgraph.level_of_label(ix, 10)
+                Ok(l)  => test.assert(l > 0)
+                Err(f) => test.fail(f.message())
+            match hnswgraph.level_of_label(ix, 11)
+                Ok(l)  => test.assert(l == 0)
+                Err(f) => test.fail(f.message())
+            test.assert(ix.top_level > 0)
+
+            test.case("labels are the caller's and slots are the package's")
+            match hnswgraph.slot_of(ix, 10)
+                Some(s) => test.assert(s == 0)
+                None    => test.fail("label 10 has no slot")
+            test.assert_none(hnswgraph.slot_of(ix, 99))
+            match hnswgraph.label_at(ix, 0)
+                Ok(l)  => test.assert(l == 10)
+                Err(f) => test.fail(f.message())
+
+            test.case("and the vector comes back as it went in")
+            match hnswgraph.vector_of(ix, 11)
+                Err(f) => test.fail(f.message())
+                Ok(v)  =>
+                    test.assert(list.len(v) == 2)
+                    test.assert_approx(v[0], 0.0, 0.000001)
+                    test.assert_approx(v[1], 1.0, 0.000001)
+            match hnswgraph.vector_base(ix, 1)
+                Ok(b)  => test.assert(b == 2)
+                Err(f) => test.fail(f.message())
+
+@test
+fn test_an_insert_refuses_what_it_cannot_store() [io]
+    match hnswparam.params(2, HnswL2, 4, 16, 2)
+        Err(f) => test.fail(f.message())
+        Ok(p)  =>
+            let e = hnswgraph.index(p)
+
+            test.case("a vector of the wrong length names both lengths")
+            match hnswgraph.insert(e, 1, [1.0, 2.0, 3.0], 0.5)
+                Ok(ix) => test.fail("a 3-vector into a 2-index of ${hnswgraph.count(ix)}")
+                Err(f) => test.assert(hnswerr.is_usage(f))
+
+            test.case("a uniform outside [0, 1) is refused rather than clamped")
+            match hnswgraph.insert(e, 1, [1.0, 0.0], 1.0)
+                Ok(ix) => test.fail("a uniform of 1.0 inserted into ${hnswgraph.count(ix)}")
+                Err(f) => test.assert(hnswerr.is_usage(f))
+
+            test.case("a label the index already holds is a caller that lost track")
+            // Silently replacing would leave the old vector's edges in
+            // the graph, pointing at a row that means something else.
+            match hnswgraph.insert(e, 1, [1.0, 0.0], 0.5)
+                Err(f)  => test.fail(f.message())
+                Ok(one) =>
+                    match hnswgraph.insert(one, 1, [0.0, 1.0], 0.5)
+                        Ok(ix) => test.fail("two elements labelled 1 in ${hnswgraph.count(ix)}")
+                        Err(f) => test.assert(hnswerr.is_usage(f))
+
+            test.case("and an index at capacity says so rather than reallocating")
+            match hnswgraph.insert(e, 1, [1.0, 0.0], 0.5)
+                Err(f)  => test.fail(f.message())
+                Ok(one) =>
+                    match hnswgraph.insert(one, 2, [0.0, 1.0], 0.5)
+                        Err(f)  => test.fail(f.message())
+                        Ok(two) =>
+                            match hnswgraph.insert(two, 3, [-1.0, 0.0], 0.5)
+                                Ok(ix) => test.fail("${hnswgraph.count(ix)} into a capacity of 2")
+                                Err(f) => test.assert(f.message() != "")
+                            test.case("and growing is what makes room")
+                            match hnswgraph.grow(two, 8)
+                                Ok(big) => test.assert(hnswgraph.params_of(big).capacity == 8)
+                                Err(f)  => test.fail(f.message())
+
+@test
+fn test_a_level_is_a_number_the_caller_may_state_outright() [io]
+    match hnswparam.params(2, HnswL2, 4, 16, 8)
+        Err(f) => test.fail(f.message())
+        Ok(p)  =>
+            test.case("insert_at_level is insert with the draw already done")
+            match hnswgraph.insert_at_level(hnswgraph.index(p), 7, [1.0, 0.0], 3)
+                Err(f) => test.fail(f.message())
+                Ok(ix) =>
+                    match hnswgraph.level_of_label(ix, 7)
+                        Ok(l)  => test.assert(l == 3)
+                        Err(f) => test.fail(f.message())
+                    test.assert(ix.top_level == 3)
+                    test.assert(ix.entry == 0)
+
+            test.case("and a negative level is not a level")
+            match hnswgraph.insert_at_level(hnswgraph.index(p), 7, [1.0, 0.0], -1)
+                Ok(ix) => test.fail("an element at level -1 in an index of ${hnswgraph.count(ix)}")
+                Err(f) => test.assert(hnswerr.is_usage(f))
+
+@test
+fn test_the_graph_holds_together_and_says_so() [io]
+    match built()
+        Err(f) => test.fail(f.message())
+        Ok(ix) =>
+            test.case("every element has neighbours at level zero")
+            match hnswgraph.degree(ix, 0, 0)
+                Ok(d)  => test.assert(d > 0)
+                Err(f) => test.fail(f.message())
+            match hnswgraph.neighbours(ix, 0, 0)
+                Ok(ns) => test.assert(list.len(ns) > 0)
+                Err(f) => test.fail(f.message())
+
+            test.case("no element has more links than the parameter allows")
+            let p = hnswgraph.params_of(ix)
+            match hnswgraph.degree(ix, 0, 0)
+                Ok(d)  => test.assert(d <= hnswparam.max_links(p, 0))
+                Err(f) => test.fail(f.message())
+
+            test.case("asking for links above an element's own level is a bug, not an empty list")
+            match hnswgraph.neighbours(ix, 1, 5)
+                Ok(ns) => test.fail("${list.len(ns)} links at level 5 on a level-0 element")
+                Err(f) => test.assert(f.message() != "")
+
+            test.case("the link base is where a run starts and is arithmetic, not a search")
+            match hnswgraph.link_base(ix, 0, 0)
+                Ok(b)  => test.assert(b >= 0)
+                Err(f) => test.fail(f.message())
+
+            test.case("the level histogram is the shape of the stack")
+            let h = hnswgraph.level_histogram(ix)
+            test.assert(list.len(h) >= 1)
+            test.assert(h[0] == 4)
+
+            test.case("and the whole graph checks out")
+            // A corrupt HNSW does not crash — it answers, worse — so
+            // the check has to be explicit and has to be run.
+            match hnswgraph.check(ix)
+                Ok(n)  => test.assert(n > 0)
+                Err(f) => test.fail(f.message())
+
+            test.case("a fresh index has not drifted")
+            test.assert_approx(hnswgraph.drift(ix), 0.0, 0.000001)
+
+@test
+fn test_a_delete_is_a_mark_and_the_element_stays_in_the_graph() [io]
+    match built()
+        Err(f) => test.fail(f.message())
+        Ok(ix) =>
+            test.case("marking one takes it out of the live count and not out of the index")
+            match hnswgraph.mark_deleted(ix, 11)
+                Err(f)  => test.fail(f.message())
+                Ok(one) =>
+                    test.assert(hnswgraph.count(one) == 4)
+                    test.assert(hnswgraph.live_count(one) == 3)
+                    test.assert(hnswgraph.deleted_count(one) == 1)
+                    match hnswgraph.is_deleted(one, 11)
+                        Ok(d)  => test.assert(d)
+                        Err(f) => test.fail(f.message())
+
+                    test.case("it is still a hop, so the graph still checks out")
+                    match hnswgraph.check(one)
+                        Ok(n)  => test.assert(n > 0)
+                        Err(f) => test.fail(f.message())
+
+                    test.case("a search does not return it")
+                    match hnswsearch.search(one, [0.0, 1.0], 4, 8)
+                        Err(f)   => test.fail(f.message())
+                        Ok(hits) =>
+                            test.assert(list.len(hits) == 3)
+                            for h in hits
+                                test.assert(h.label != 11)
+
+                    test.case("and the mark comes off for nothing, because nothing was thrown away")
+                    match hnswgraph.unmark_deleted(one, 11)
+                        Ok(back) => test.assert(hnswgraph.live_count(back) == 4)
+                        Err(f)   => test.fail(f.message())
+
+                    test.case("a deleted slot is what the next insert reclaims")
+                    match hnswgraph.insert_replacing(one, 20, [0.5, 0.5], 0.5)
+                        Err(f) => test.fail(f.message())
+                        Ok(re) =>
+                            test.assert(hnswgraph.count(re) == 4)
+                            test.assert(hnswgraph.live_count(re) == 4)
+                            test.assert(hnswgraph.drift(re) > 0.0)
+
+            test.case("and a label nothing carries is not a delete")
+            match hnswgraph.mark_deleted(ix, 99)
+                Ok(one) => test.fail("label 99 deleted from ${hnswgraph.count(one)}")
+                Err(f)  => test.assert(hnswerr.is_usage(f) == false)
+
+@test
+fn test_ef_is_the_knob_and_it_may_not_be_smaller_than_k() [io]
+    match built()
+        Err(f) => test.fail(f.message())
+        Ok(ix) =>
+            test.case("a query finds its own nearest first")
+            match hnswsearch.search(ix, [0.9, 0.1], 2, 8)
+                Err(f)   => test.fail(f.message())
+                Ok(hits) =>
+                    test.assert(list.len(hits) == 2)
+                    test.assert(hits[0].label == 10)
+                    test.assert(hits[0].distance <= hits[1].distance)
+
+            test.case("asking for more than the index holds gives what it holds")
+            match hnswsearch.search(ix, [1.0, 0.0], 100, 100)
+                Ok(hits) => test.assert(list.len(hits) == 4)
+                Err(f)   => test.fail(f.message())
+
+            test.case("an ef below k cannot return k and is refused rather than short")
+            match hnswsearch.search(ix, [1.0, 0.0], 4, 2)
+                Ok(hits) => test.fail("${list.len(hits)} hits at ef 2 for k 4")
+                Err(f)   => test.assert(hnswerr.is_usage(f))
+
+            test.case("a k below one asks for nothing")
+            match hnswsearch.search(ix, [1.0, 0.0], 0, 8)
+                Ok(hits) => test.fail("${list.len(hits)} hits for k 0")
+                Err(f)   => test.assert(hnswerr.is_usage(f))
+
+            test.case("a query of the wrong length is the commonest fault there is")
+            match hnswsearch.search(ix, [1.0, 0.0, 0.0], 1, 8)
+                Ok(hits) => test.fail("${list.len(hits)} hits for a 3-vector query")
+                Err(f)   => test.assert(hnswerr.is_usage(f))
+
+            test.case("and the default ef is there for a caller who has not measured")
+            match hnswsearch.search_default(ix, [1.0, 0.0], 2)
+                Ok(hits) => test.assert(list.len(hits) == 2)
+                Err(f)   => test.fail(f.message())
+
+    test.case("an index with nothing in it says so rather than answering empty")
+    match hnswparam.default_params(2, HnswL2)
+        Err(f) => test.fail(f.message())
+        Ok(p)  =>
+            match hnswsearch.search(hnswgraph.index(p), [1.0, 0.0], 1, 8)
+                Ok(hits) => test.fail("${list.len(hits)} hits out of an empty index")
+                Err(f)   => test.assert(hnswerr.is_usage(f) == false)
+
+@test
+fn test_the_descent_is_two_functions_and_both_are_public() [io]
+    match built()
+        Err(f) => test.fail(f.message())
+        Ok(ix) =>
+            test.case("one level's greedy walk is the whole algorithm")
+            match hnswsearch.search_layer(ix, [1.0, 0.0], ix.entry, 4, 0)
+                Err(f) => test.fail(f.message())
+                Ok(cs) =>
+                    test.assert(list.len(cs) > 0)
+                    test.assert(cs[0].slot >= 0)
+
+            test.case("and the ef-of-one form is what the upper levels use")
+            match hnswsearch.greedy_step(ix, [1.0, 0.0], ix.entry, ix.top_level)
+                Ok(s)  => test.assert(s >= 0)
+                Err(f) => test.fail(f.message())
+
+            test.case("a filter runs during the descent and not after it")
+            // Filtering afterwards gives fewer than k results whenever
+            // the filter is at all selective; applied during the
+            // descent, ef is the budget and k is still the answer.
+            match hnswsearch.search_filtered(ix, [1.0, 0.0], 2, 8, is_even_label)
+                Err(f)   => test.fail(f.message())
+                Ok(hits) =>
+                    for h in hits
+                        test.assert(h.label % 2 == 0)
+
+            test.case("brute force is the answer the graph is approximating")
+            match hnswsearch.brute_force(ix, [1.0, 0.0], 4)
+                Err(f)    => test.fail(f.message())
+                Ok(exact) =>
+                    test.assert(list.len(exact) == 4)
+                    test.assert(exact[0].label == 10)
+                    test.assert(list.len(hnswsearch.hit_labels(exact)) == 4)
+
+                    test.case("and recall is the two compared")
+                    match hnswsearch.search(ix, [1.0, 0.0], 4, 8)
+                        Err(f)     => test.fail(f.message())
+                        Ok(approx) =>
+                            test.assert_approx(hnswsearch.recall_at(approx, exact), 1.0, 0.000001)
+
+            test.case("recall over an empty exact set is zero and not one")
+            test.assert_approx(hnswsearch.recall_at([], []), 0.0, 0.000001)
+
+            test.case("a distance to one named element uses the index's own metric")
+            match hnswsearch.distance_to(ix, [1.0, 0.0], 12)
+                Ok(d)  => test.assert_approx(d, 4.0, 0.000001)
+                Err(f) => test.fail(f.message())
+
+            test.case("and the cost model answers before anything is measured")
+            test.assert(hnswsearch.expected_comparisons(ix, 8) > 0.0)
+
+// A filter over the caller's own labels, as a named function: a lambda
+// that becomes a value is refused at the embedded tier, and a package
+// whose filters are named works at every tier its consumers do.
+fn is_even_label(label: Int) -> Bool
+    label % 2 == 0
+
+@test
+fn test_the_serialised_form_has_a_magic_and_reads_back_equal() [io]
+    test.case("the format says what it is before it says anything else")
+    // hnswlib's own file is a raw memory dump with no magic, no
+    // version and no dimension, so a file read by the wrong build
+    // produces an index rather than an error.  This one does not.
+    test.assert(hnswio.format_version() == 1)
+    test.assert(hnswio.header_bytes() == 48)
+    test.assert(list.len(hnswio.supported_versions()) >= 1)
+    test.assert(hnswio.magic_le() != 0)
+
+    match built()
+        Err(f) => test.fail(f.message())
+        Ok(ix) =>
+            test.case("the size is exact, not an upper bound")
+            match hnswio.size_bound(ix)
+                Err(f) => test.fail(f.message())
+                Ok(n)  =>
+                    test.assert(n > hnswio.header_bytes())
+                    match hnswio.to_bytes(ix)
+                        Ok(b)  => test.assert(bytes.len(b) == n)
+                        Err(f) => test.fail(f.message())
+
+                    test.case("and a buffer smaller than it says so, and is not corruption")
+                    match hnswio.write_into(ix, bytes.zeros(16), 16)
+                        Ok(w)  => test.fail("${w} bytes into room for sixteen")
+                        Err(f) => test.assert(hnswerr.is_usage(f) == false)
+
+            test.case("the header reads without the index behind it")
+            match hnswio.to_bytes(ix)
+                Err(f) => test.fail(f.message())
+                Ok(b)  =>
+                    test.assert(hnswio.is_index(b))
+                    match hnswio.peek_header(b)
+                        Err(f) => test.fail(f.message())
+                        Ok(h)  =>
+                            test.assert(h.dim == 2)
+                            test.assert(h.count == 4)
+                            test.assert(h.metric == hnswdist.metric_code(HnswL2))
+                            test.assert(h.version == hnswio.format_version())
+                            test.assert(h.total_bytes == bytes.len(b))
+
+                            test.case("and a cache compares the dimension and the metric, not the tuning")
+                            test.assert(hnswio.header_matches(h, hnswgraph.params_of(ix)))
+
+                    test.case("and the index reads back equal to the one that was written")
+                    // A serialisation that round-trips approximately is
+                    // one that quietly changes results.
+                    match hnswio.from_bytes(b)
+                        Err(f)   => test.fail(f.message())
+                        Ok(back) =>
+                            test.assert(hnswgraph.count(back) == 4)
+                            test.assert(back.entry == ix.entry)
+                            test.assert(back.top_level == ix.top_level)
+                            test.assert(list.len(back.links) == list.len(ix.links))
+                            match hnswgraph.check(back)
+                                Ok(n)  => test.assert(n > 0)
+                                Err(f) => test.fail(f.message())
+
+    test.case("bytes that are not this format are refused at the fourth one")
+    test.assert(hnswio.is_index(bytes.zeros(48)) == false)
+    match hnswio.peek_header(bytes.zeros(48))
+        Ok(h)  => test.fail("zeros parsed as v${h.version}")
+        Err(f) => test.assert(hnswerr.is_format(f))
+
+    test.case("and a header that is not all there is a truncation, not a guess")
+    match hnswio.from_bytes(bytes.zeros(4))
+        Ok(back) => test.fail("four bytes parsed into ${hnswgraph.count(back)} element(s)")
+        Err(f)   => test.assert(hnswerr.is_format(f))

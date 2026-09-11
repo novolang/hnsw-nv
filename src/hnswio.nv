@@ -1,0 +1,172 @@
+// hnswio.nv — the serialised form: an index written into a caller's
+// buffer and read back, with a magic and a version on the front.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// IT IS NOT hnswlib'S FILE, AND THAT IS DELIBERATE.  hnswlib's
+// `saveIndex` writes its own memory: the element size in bytes, then
+// the raw per-element blocks exactly as the process laid them out.  The
+// file is therefore specific to the pointer width, the endianness, the
+// `size_t` of the machine that wrote it, and the version of the library
+// — and it carries no magic, no version and no dimension, so a file
+// read by the wrong build produces an index rather than an error.
+//
+// This format has a magic, a version, the parameters in full, and every
+// field written at a stated width in a stated byte order.  A file this
+// package wrote is readable by any build of it on any machine, and a
+// file it did not write is refused at the fourth byte.
+//
+// WHAT TRAVELS AND WHAT DOES NOT.  Everything that makes the index what
+// it is travels: the parameters including the level multiplier, every
+// vector, every label, every mark, every level and every link.  So a
+// read-back index is EQUAL to the one that was written, which is an
+// assertion in the suite and not a hope — a serialisation that
+// round-trips approximately is one that quietly changes results.
+//
+// WHY A WRITER INTO A CALLER'S BUFFER.  `to_bytes` is the convenient
+// call; `write_into` is the one for a caller that has already reserved
+// the space — a preallocated file, a memory-mapped region, a page of a
+// key/value store — because an index is the biggest value this package
+// makes and copying it to hand it over is a cost worth being able to
+// avoid.  `size_bound` is exact, not an upper bound: every field's
+// width follows from the parameters and the counts.
+//
+// THE FLOATS ARE WRITTEN AS 64-BIT IEEE 754, little-endian, and that
+// is the format's one extravagance.  An index of a million 768-element
+// vectors is 6 GB rather than 3, and a caller that minds has two
+// answers, both better than a lossy serialisation: quantise before
+// inserting, with embeddings-nv, so the index stores what it will
+// compare; or keep the vectors outside and hold only ids.  Writing
+// f32 here would round every vector on the way out and produce an
+// index that is not the one that was saved.
+
+// What a serialised index says about itself before its bytes.
+//
+// Read by `peek_header` without reading the index, which is what a
+// cache validating an entry wants: a header is 48 bytes and tells it
+// whether the dimension, the metric and the format version still match
+// what it is about to search.
+//
+// ```novo
+// use hnswio
+//
+// fn main() [io]
+//     println("${hnswio.header_bytes()}")
+//     // : 48
+// ```
+pub struct HnswFileHeader
+    // The format version — `format_version` is what this package
+    // writes.
+    version: Int
+    // The vectors' length.
+    dim: Int
+    // The metric's code — `hnswdist.metric_of_code` turns it back.
+    metric: Int
+    // How many elements, deleted ones included.
+    count: Int
+    // The `M` the index was built with.
+    m: Int
+    // The `ef_construction` it was built with.
+    ef_construction: Int
+    // How many bytes the whole serialised index is, this header
+    // included.  Carried so that a caller reading from a stream knows
+    // how much to read, and so that a truncation is caught before the
+    // parse rather than during it.
+    total_bytes: Int
+
+// The four magic bytes, as a little-endian 32-bit integer.
+//
+// The thing hnswlib's own file does not have, and the reason a file
+// from the wrong tool is an error here rather than an index.
+pub fn magic_le() -> Int
+    todo("hnsw-nv.hnswio.magic_le")
+
+// The format version this package writes: 1.
+//
+// Bumped when a field is added, removed or re-widened.  A reader
+// refuses a version it does not know rather than reading the fields it
+// recognises, because a graph half-read is a graph that answers.
+pub fn format_version() -> Int
+    todo("hnsw-nv.hnswio.format_version")
+
+// The versions this package reads.
+pub fn supported_versions() -> [Int]
+    todo("hnsw-nv.hnswio.supported_versions")
+
+// How many bytes the header occupies: 48.
+pub fn header_bytes() -> Int
+    todo("hnsw-nv.hnswio.header_bytes")
+
+// Exactly how many bytes this index serialises to.
+//
+// Exact rather than an upper bound.  The header, then the parameters,
+// then `count * dim` doubles, then the labels, the marks, the levels,
+// the link counts and the links — every one of those a stated width
+// times a known count.
+pub fn size_bound(ix: HnswIndex) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswio.size_bound")
+
+// The index's bytes.
+//
+// ```novo
+// use hnswio
+// use hnswgraph
+// use hnswparam
+//
+// fn main() [io]
+//     match hnswparam.default_params(2, HnswL2)
+//         Err(f) => println(f.message())
+//         Ok(p)  =>
+//             match hnswio.to_bytes(hnswgraph.index(p))
+//                 Ok(b)  => println("${bytes.len(b) >= hnswio.header_bytes()}")
+//                 Err(f) => println(f.message())
+// ```
+pub fn to_bytes(ix: HnswIndex) -> Result<Bytes, HnswFault>
+    todo("hnsw-nv.hnswio.to_bytes")
+
+// The index written into a buffer the caller sized.
+//
+// `HnswOutputFull` with both numbers when `room` is smaller than
+// `size_bound`, and the count written when it is not.  The buffer is
+// not resized and nothing past that count is touched.
+pub fn write_into(ix: HnswIndex, into: Bytes, room: Int) -> Result<Int, HnswFault>
+    todo("hnsw-nv.hnswio.write_into")
+
+// The header, from the first `header_bytes` of a serialised index.
+//
+// `HnswBadMagic` when the four bytes are not this format's,
+// `HnswBadVersion` for a version this package does not read, and
+// `HnswTruncated` when there are fewer than 48 bytes.
+//
+// The call a cache makes before it commits to reading six gigabytes:
+// the dimension and the metric are here, and an entry built for a
+// different model is discarded without being parsed.
+pub fn peek_header(b: Bytes) -> Result<HnswFileHeader, HnswFault>
+    todo("hnsw-nv.hnswio.peek_header")
+
+// The index, from its bytes.
+//
+// Runs `hnswgraph.check` before it answers, so a file that reads back
+// into an inconsistent graph is `HnswCorruptGraph` here rather than a
+// wrong answer three hours later.  That check is the reason this is a
+// `Result` over a graph fault as well as over the format ones.
+pub fn from_bytes(b: Bytes) -> Result<HnswIndex, HnswFault>
+    todo("hnsw-nv.hnswio.from_bytes")
+
+// Whether these bytes start with this format's magic.
+//
+// Four bytes is enough.  The sniff a caller makes over a directory of
+// cache files before it decides which are its.
+pub fn is_index(b: Bytes) -> Bool
+    todo("hnsw-nv.hnswio.is_index")
+
+// Whether a serialised index can be searched with these parameters.
+//
+// The dimension and the metric must match exactly; `M` and
+// `ef_construction` need not, because they shaped the graph that was
+// saved and do not constrain a search of it.  The distinction a cache
+// wants and gets wrong in both directions: refusing a perfectly good
+// index because a tuning parameter moved, or accepting one built for a
+// different model because only the dimension was compared.
+pub fn header_matches(h: HnswFileHeader, p: HnswParams) -> Bool
+    todo("hnsw-nv.hnswio.header_matches")

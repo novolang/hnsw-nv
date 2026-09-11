@@ -1,0 +1,71 @@
+[package]
+name        = "hnsw-nv"
+version     = "0.0.1"
+description = "Hierarchical Navigable Small World: an approximate nearest-neighbour index as a VALUE.  Build parameters, insert with the level the caller's own randomness chose, k-nearest search with ef, three distance metrics, delete by mark with slot reuse, and a versioned serialised form written into a caller's buffer and read back.  No threads, no file, no clock and no entropy — the RNG arrives as one uniform per insert, because a `core` package may not reach a `host` one.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and the layer decided the one part of the design a reader
+# will notice.
+#
+# HNSW's construction is randomised: each element is assigned a level
+# from a geometric distribution, and hnswlib draws it from an RNG the
+# index owns.  rand-nv is `host` — the entropy comes from the machine —
+# and a `core` package may not depend on a `host` one.  So the uniform
+# arrives as an ARGUMENT: `hnswgraph.insert(ix, label, v, u)` takes one
+# number in [0, 1) and turns it into a level with the index's own
+# multiplier.  fake-nv took the same decision for the same reason, and
+# stats-nv takes its uniforms as arguments too.
+#
+# What the layer bought in exchange: a build is reproducible.  The same
+# sequence of uniforms builds the same graph on any machine, in any
+# order of calls, which is what makes a serialised index comparable
+# with the one that produced it.
+#
+# No `@tier(embedded)` claim — see README, "The layer, and the claim
+# this package does not make".
+layer       = "core"
+
+category    = "ai"
+
+tags        = ["hnsw", "ann", "nearest-neighbour", "vector-index", "similarity", "search", "embeddings", "sans-io"]
+repository  = "https://github.com/novolang/hnsw-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A vector index you can copy"
+
+[dependencies]
+# None, and all three absences are deliberate.
+#
+# NOT rand-nv, because it is `host` and this is `core` — see the note
+# on `layer` above.  The uniform is a parameter.
+#
+# NOT ndarray-nv.  A row here is a `[Float]`, not an `NdFloat`: an
+# index holds N rows of ONE dimension, which it already knows from its
+# own parameters, so a shape, a stride set and an offset per row would
+# be three integers and a struct restating a fact the index holds once.
+# The hot path is one distance between two flat buffers, and a strided
+# view would have to be packed before it could be walked.
+# `ndfloat.to_list(ndfloat.index_axis(m, 0, i)!)` is the one line that
+# converts, and embeddings-nv — which does speak `NdFloat` — is where a
+# caller coming from a model meets it.  README, "Why a row is a list".
+#
+# NOT embeddings-nv.  The arithmetic there is about what an embedding
+# MEANS — pooling, normalisation, Matryoshka truncation, quantisation —
+# and this package is about a graph.  The three distances they share
+# are ten lines each, and a dependency between two `core` packages to
+# avoid thirty lines would put a whole vector library in every consumer
+# of an index.  They agree on the definitions and the test vectors
+# instead, which is checked by a shared assertion rather than by a
+# shared symbol.
