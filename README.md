@@ -1,301 +1,325 @@
 # hnsw-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+A nearest-neighbour index answers the question "which of these million
+vectors is closest to this one" without comparing all of them. Hierarchical
+Navigable Small World is the structure almost every vector database uses to
+do it, described in Malkov and Yashunin,
+[*Efficient and robust approximate nearest neighbor search using
+Hierarchical Navigable Small World graphs*](https://arxiv.org/abs/1603.09320)
+(2018). This package brings it to novo-lang as a value: an index is built,
+searched, copied, written out and read back, and nothing in it is a handle.
+The reference implementation is
+[hnswlib](https://github.com/nmslib/hnswlib).
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What HNSW is
 
-**Hierarchical Navigable Small World**: the approximate
-nearest-neighbour index behind every vector database, as a **value**.
-Build it, search it, mark elements deleted, copy it, serialise it, read
-it back — with no threads, no file, no clock and no entropy of its own.
+An **element** is one vector with a **label**, an identifier the caller
+chooses. The index holds every element's vector in one buffer and a graph
+of links between them.
 
-Six modules, and no dependencies.
+The graph is a stack of **levels**. Level 0 holds every element. Each level
+above holds a thinning sample of the level below, so the top level has a
+handful of elements and the bottom has all of them. A search starts at the
+top with one entry point, walks greedily downhill to the nearest element it
+can reach on that level, drops to the level below, and repeats. By the time
+it reaches level 0 it is already near the answer.
 
-| surface | module | reach for it when |
+Which level an element joins is drawn at random from a geometric
+distribution: `floor(-ln(u) * mL)`, where `u` is a uniform random number in
+[0, 1) and `mL` is the **level multiplier**. The paper recommends
+`mL = 1 / ln(M)`, which makes the expected work per query grow with the
+logarithm of the number of elements.
+
+Three numbers shape an index. **M** is how many links each element keeps
+per level, and it trades memory for recall. **ef_construction** is how many
+candidates the builder considers while linking a new element, and it trades
+build time for graph quality. **ef** is how many candidates a search keeps
+as it descends, and it trades query time for how many of the true nearest
+neighbours come back. **k** is only how many results the caller wants.
+
+**Recall** is the fraction of the true nearest neighbours a search actually
+found. HNSW is approximate, so recall is below 1, and `ef` is the one knob
+that moves it at query time.
+
+Every comparison this package makes is a **distance**, and smaller is
+nearer, because the priority queues are minima and the descent walks
+downhill.
+
+| Metric | Is | Range |
 | --- | --- | --- |
-| the **index** | `hnswgraph` | you are building one, or looking inside it |
-| the **search** | `hnswsearch` | you have a query |
-| the **parameters** | `hnswparam` | you are choosing M and ef, or measuring what they cost |
-| the **distances** | `hnswdist` | you are choosing a metric, or doing your own arithmetic |
-| the **file** | `hnswio` | you are caching an index between runs |
-| the **faults** | `hnswerr` | you are telling somebody why their query did not run |
-
-## Adding it, and checking it
-
-```bash
-novo pkg add hnsw-nv               # into your novo.toml
-novo pkg build                     # type- and effect-check the package
-novo test --isolate tests/hnswindex_tests.nv
-```
-
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: hnsw-nv.<module>.<fn>`.  They
-turn green one at a time as bodies land.
-
-## The one example that will work
-
-```novo
-use hnswgraph
-use hnswparam
-
-fn main() [io]
-    match hnswparam.default_params(4, HnswL2)
-        Err(f) => println(f.message())
-        Ok(p)  => println("${hnswgraph.count(hnswgraph.index(p))}")
-                  // : 0
-```
-
-## The load-bearing interface
-
-```novo norun:pseudo
-pub fn insert(ix: HnswIndex, label: Int, v: [Float], u: Float)
-    -> Result<HnswIndex, HnswFault>
-```
-
-**`u` is one uniform in [0, 1), and it is the whole of the randomness
-HNSW needs.**
-
-HNSW is a stack of graphs: level 0 holds everything and each level above
-holds a geometrically thinning sample, so a search starts at the top
-with a handful of elements and descends.  Which level an element joins
-is drawn from a geometric distribution — `floor(-ln(u) * mL)` — and
-hnswlib holds a `std::mt19937` inside the index to draw it.
-
-This package cannot.  **rand-nv is `host`**, because the entropy comes
-from the machine, and a `core` package may not depend on a `host` one.
-So the draw is the caller's and the arithmetic is the index's:
-`hnswparam.level_of` turns `u` into a level, and every other thing an
-insert does is deterministic.  fake-nv took the same decision for the
-same reason, and stats-nv takes its uniforms as arguments too.
-
-**What the layer took, and what it gave back.**  It took the
-convenience of an index that seeds itself — a caller now writes
-`ix = insert(ix, id, v, rng.next_float())!` and holds its own RNG.  It
-gave **reproducibility**: a build is a pure function of the vectors and
-the uniform sequence, so the same inputs build the same graph on any
-machine in any process.  That is what makes a serialised index
-comparable with the one that produced it, what makes an assertion about
-an edge an assertion rather than a flake, and what turns "recall dropped
-after that change" from an argument into a bisect.
-
-`insert_at_level` is the same function with the draw already done, for
-the two callers that have a level rather than a number: a rebuild from
-a serialised index, and a test that wants a graph of a known shape.
-
-## An index is a value, and copying one is a copy
-
-Every function takes an index and returns one; nothing mutates.  That is
-what a `core` package with no interior mutability can offer, and it has
-one consequence worth sizing before you start: **an insert copies the
-index**.  The implementation's job is to make that a Perceus in-place
-update when the caller holds the only reference, which is what
-
-```novo norun:pseudo
-var ix = hnswgraph.index(p)
-for i in 0..n
-    ix = hnswgraph.insert(ix, ids[i], vecs[i], us[i])!
-```
-
-gives it.  A caller that keeps the old index around gets a real copy —
-and being *able* to is the point.  An index you can snapshot, hand to
-another thread, or roll back is a different thing from one you cannot.
-
-## Why a row is a `[Float]` and not an `NdFloat`
-
-An index holds N rows of **one** dimension, which it already knows from
-its own parameters.  An `NdFloat` per row would carry a shape, a stride
-set and an offset — three integers and a struct restating a fact the
-index holds once — and the hot path here is a single walk down two
-contiguous buffers, which a strided view would have to be packed into
-first.
-
-It also keeps the dependency list empty, which matters more than it
-sounds: a program that wants a vector index should not download an array
-library to get one.
-
-The seam is one line, and **embeddings-nv** is where a caller coming
-from a model meets it:
-
-```novo norun:pseudo
-let row = ndfloat.to_list(ndfloat.index_axis(matrix, 0, i)!)
-ix = hnswgraph.insert(ix, id, row, u)!
-```
-
-embeddings-nv does speak `NdFloat`, because its subject is a
-token-embedding matrix and a shape is what that is.  This package's
-subject is a graph.
-
-## Everything is a distance, and smaller is nearer
-
-HNSW compares, and every comparison it makes is a minimum: the priority
-queues are minima and the greedy descent walks downhill.  So the two
-similarity-shaped metrics are defined as their distance forms, in one
-place, rather than inverted at every call site:
-
-| metric | is | range |
-| --- | --- | --- |
-| `HnswL2` | `sum((a - b)^2)` | `[0, ∞)` |
-| `HnswCosine` | `1 - cos(a, b)` | `[0, 2]` |
+| `HnswL2` | `sum((a - b)²)` | 0 and above |
+| `HnswCosine` | `1 - cos(a, b)` | 0 to 2 |
 | `HnswInner` | `1 - dot(a, b)` | unbounded, and may be negative |
 
-**L2 is squared on purpose.**  The square root is monotonic, so taking
-it changes no ordering, no queue and no graph — and it costs a call per
-comparison in the hottest loop there is.  `hnswdist.l2` is there for a
-caller reporting a real distance to a person.
+The defaults, which are hnswlib's:
 
-**Inner product is not a metric**, for vectors that are not unit length:
-it breaks the triangle inequality, so the greedy descent has no proof
-behind it and recall becomes an empirical question rather than a bounded
-one.  hnswlib makes the same choice, calls it `InnerProductSpace`, and
-it works well in practice — on normalised vectors, where it *is* the
-cosine distance and is cheaper because it skips two norms.  On
-unnormalised ones, measure.
+| Parameter | Default |
+| --- | --- |
+| `m` | 16 |
+| `ef_construction` | 200 |
+| `capacity` | 1024 |
+| Links per element, level 0 | 2 × `m` |
+| Links per element, above level 0 | `m` |
+| `m`, allowed range | 2 to 128 |
+| Serialised header | 48 bytes |
+| Serialised float width | 8 bytes |
 
-**This package does not normalise for you.**  An index that normalised
-what it was given would answer a cosine query correctly and hand back a
-vector the caller did not store, and a caller that wanted L2 over
-magnitudes would find them gone.  `hnswdist.normalize` is one call, at
-the point where the caller knows whether it wants it, and
-`hnswdist.wants_normalized` is what the package will say instead.
+This package performs no input or output. It opens no file, starts no
+thread, reads no clock and draws no random numbers. Every effect row in it
+is empty.
 
-## `ef` is the knob, and it is the only per-query one
+## Install
 
-Everything else is fixed when the index is built.  A search keeps a
-candidate list of `ef` elements as it descends; larger finds more and
-costs more, and `k` is only how many of them come back.
+```
+novo pkg add hnsw-nv
+```
 
-**`ef` below `k` is refused**, rather than quietly returning fewer
-results than were asked for — that failure is invisible at the call
-site and shows up as a product that is subtly worse.
+## Example
 
-To choose one: `hnswsearch.brute_force` is the exact answer,
-`hnswsearch.recall_at` compares it with an approximate one, and
-`hnswsearch.expected_comparisons` is the cost model.  Run both over a
-sample of real queries and read the curve; the number that comes out is
-a property of the data, not of the library, which is why this package
-ships the measurement rather than a recommendation.
+```novo
+use hnswparam
+use hnswgraph
+use hnswsearch
 
-**Filtering happens during the descent**, not after it.
-`search_filtered` takes a named `fn(Int) -> Bool` over the caller's own
-labels.  Filtering afterwards gives fewer than `k` results whenever the
-filter is at all selective, and the usual workaround — ask for ten times
-as many — costs ten times as much and still has no bound.  What a
-during-the-descent filter cannot promise: a filter that accepts almost
-nothing turns the search into a walk of the graph, and a caller whose
-filters are that selective wants one index per partition.
+// Build a two-dimensional index over three points and answer the one
+// nearest a query. The uniform per insert is the caller's: the index
+// turns it into the level the element joins at, and writing the
+// numbers down makes the graph the same on every run.
+fn nearest(query: [Float]) -> Result<[HnswHit], HnswFault>
+    let p = hnswparam.default_params(2, HnswL2)!
+    var ix = hnswgraph.index(p)
+    ix = hnswgraph.insert(ix, 1, [0.0, 0.0], 0.11)!
+    ix = hnswgraph.insert(ix, 2, [1.0, 0.0], 0.42)!
+    ix = hnswgraph.insert(ix, 3, [0.0, 1.0], 0.73)!
+    let hits = hnswsearch.search(ix, query, 1, 10)!
+    Ok(hits)
 
-## A delete is a mark
+fn main() [io]
+    match nearest([0.9, 0.1])
+        Err(f)   => println(f.message())
+        Ok(hits) =>
+            for h in hits
+                // The label is the id this program gave the point, and
+                // the distance is under the index's metric, where
+                // smaller is nearer.
+                println("${h.label} at ${h.distance}")
+```
 
-`mark_deleted` sets a flag.  The element keeps its vector and its links;
-searches skip it as a **result** and still walk **through** it as a hop.
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a `not implemented: hnsw-nv.<module>.<fn>`
+panic. The tests are the specification the implementation will have to
+satisfy.
 
-That is hnswlib's behaviour and it is not a shortcut.  Removing an
-element cuts the graph, and repairing the cut means re-running the
-neighbour selection for everything that pointed at it — at which point a
-rebuild is cheaper and better.  `insert_replacing` reclaims the slot,
-`hnswgraph.drift` says how far the index has moved from a fresh build,
-and past about half, rebuilding wins.
+## What the package contains
 
-## The file is not hnswlib's file
+| Module | Contents |
+| --- | --- |
+| `hnswparam` | The build parameters and their bounds, the level multiplier, and the formula that turns a uniform into a level. |
+| `hnswdist` | The three metrics, each distance on its own, and the vector helpers: the norm, normalisation and the finiteness check. |
+| `hnswgraph` | The index as a value: insertion, the delete mark, slot reuse, growth, and the readers that look inside the graph. |
+| `hnswsearch` | Searching: k-nearest, k-nearest with a filter, one level's walk, the exact answer, and the recall and cost measurements. |
+| `hnswio` | The serialised form: a header, an exact size, the bytes, and a reader that checks the graph before it answers. |
+| `hnswerr` | Every reason a call refuses, split into the caller's mistakes and a file's faults. |
 
-hnswlib's `saveIndex` writes its own memory: the element size in bytes,
-then the raw per-element blocks as the process laid them out.  It is
-specific to the pointer width, the endianness and the library version of
-the machine that wrote it, and it carries **no magic, no version and no
-dimension** — so a file read by the wrong build produces an index rather
-than an error.
+## How to choose an entry point
 
-`hnswio` writes a magic, a version, the parameters in full, and every
-field at a stated width in a stated byte order.  `peek_header` reads 48
-bytes and tells a cache whether the entry is still for its model without
-parsing six gigabytes behind it.  A read runs `hnswgraph.check` before
-it answers, because a corrupt HNSW does not crash — it answers, worse.
+**`hnswgraph.insert` takes a uniform and draws the level from it.** Use it
+when you are building an index from a random number generator.
+**`hnswgraph.insert_at_level` takes the level outright.** Use it when
+rebuilding from a recorded level sequence, and in a test that wants a graph
+of a known shape. `insert` is `hnswparam.level_of` in front of
+`insert_at_level`, and both are public.
 
-**The floats are 64-bit**, and that is the format's one extravagance: a
-million 768-element vectors is 6 GB rather than 3.  Writing f32 would
-round every vector on the way out and produce an index that is not the
-one that was saved.  A caller that minds has two better answers:
-quantise before inserting, with embeddings-nv, so the index stores what
-it will compare; or keep the vectors outside and index ids alone.
+**`hnswsearch.search` takes `ef`.** Use it once you have measured one.
+**`search_default`** picks `max(k, ef_construction / 4)`, which is a
+starting point for a caller that has measured nothing yet.
+**`search_filtered`** takes a predicate over labels and applies it during
+the descent.
 
-## What usearch does differently, and whether there is room
+**`hnswsearch.brute_force` is the exact answer**, at a cost linear in the
+index. It is not a fallback; it is what `recall_at` compares an approximate
+answer against when you are choosing `ef`.
 
-usearch's headline difference is **quantised distances**: it stores
-vectors as f16, i8 or single bits and computes the metric in that
-representation, which is where most of its speed and nearly all of its
-memory advantage come from.  It also does hardware SIMD dispatch, memory
-maps an index rather than loading it, and supports user-defined metrics.
+**`hnswsearch.search_layer` is one level's walk**, and it is public because
+it is the algorithm. A caller doing a sharded search, a two-stage re-rank
+or a recall harness should not have to write it again.
 
-Of those, three fit inside this interface without changing it.  SIMD
-dispatch is an implementation detail of `hnswdist`.  A memory-mapped
-index is a `host` package over `hnswio`'s format — the row for it is
-**vectorstore-nv**, already on the grid.  A user-defined metric is a
-named `fn([Float], [Float]) -> Float` and would be a variant on
-`HnswMetric` carrying one.
+**`hnswio.peek_header` reads 48 bytes.** It tells a cache whether a stored
+index is still the right one for its model without parsing gigabytes behind
+it. `from_bytes` reads the whole thing.
 
-**Quantised storage does not fit**, and this package says so rather than
-implying otherwise.  `HnswIndex.data` is a `[Float]`; storing i8 or bits
-means a different field, and changing a public field is a breaking
-change.  So the honest position for 0.0.1 is: the *distance* enum has
-room for another variant, the *storage* does not, and the two ways
-forward are a scalar-kind field on `HnswIndex` at 0.1 — decided before
-the first body, while it is still free — or a separate binary index over
-embeddings-nv's Hamming distance, which is a different structure and
-probably a different row.  **This lane's report asks for that decision
-rather than making it.**
+## The rules a user needs
 
-## The layer, and the claim this package does not make
+1. **The uniform is yours, and it is the whole of the randomness HNSW
+   needs.** `hnswgraph.insert` takes one number in [0, 1) per element, and
+   `hnswparam.level_of` applies the paper's Algorithm 1 formula
+   `floor(-ln(u) * mL)`. A build is therefore a pure function of the
+   vectors and the uniform sequence: the same inputs build the same graph
+   on any machine. A caller with a random number generator passes
+   `rng.next_float()`.
+2. **An index is a value and every call answers a new one.** Writing
+   `ix = hnswgraph.insert(ix, id, v, u)!` in a loop lets the runtime update
+   in place, because the caller holds the only reference. A caller that
+   keeps the old index gets a real copy, which is what makes a snapshot and
+   a rollback possible.
+3. **Smaller is nearer, everywhere in this package.** The two
+   similarity-shaped metrics are stored as `1 - similarity`, so every
+   comparison is a minimum. `embeddings-nv` uses the opposite convention
+   and `embsim.as_distance` is the conversion.
+4. **`HnswL2` is the squared distance, on purpose.** The square root is
+   monotonic, so taking it changes no ordering, no queue and no graph, and
+   it costs a call in the hottest loop there is. `hnswdist.l2` is the real
+   distance, for reporting one to a person.
+5. **Inner product is not a metric on vectors that are not unit length.**
+   It breaks the triangle inequality, so the greedy descent has no proof
+   behind it and recall becomes something to measure rather than something
+   bounded. On normalised vectors it is the cosine distance and is cheaper,
+   because it skips two norms.
+6. **Nothing here normalises for you.** An index that normalised what it
+   was given would hand back a vector the caller never stored.
+   `hnswdist.wants_normalized` says which metrics expect it, and
+   `hnswdist.normalize` is one call at the point where the caller knows.
+7. **`ef` below `k` is refused.** Returning fewer results than were asked
+   for is invisible at the call site and shows up as a product that is
+   quietly worse.
+8. **Measure `ef` on your own data.** `hnswsearch.brute_force` is the exact
+   answer, `recall_at` compares an approximate answer with it, and
+   `expected_comparisons` is the cost model. The number that comes out is a
+   property of the data rather than of this package, which is why there is
+   a measurement here and no recommendation.
+9. **Filtering happens during the descent.** `search_filtered` takes a
+   named function over labels, not a closure, and applies it as it walks.
+   Filtering afterwards gives fewer than `k` results whenever the filter is
+   at all selective. What it cannot promise: a filter that accepts almost
+   nothing turns the search into a walk of the whole graph, and a caller
+   whose filters are that selective wants one index per partition.
+10. **A delete is a mark.** `mark_deleted` sets a flag; the element keeps
+    its vector and its links, is skipped as a result, and is still walked
+    through as a hop. Removing an element outright would cut the graph, and
+    repairing the cut means re-running the neighbour selection for
+    everything that pointed at it.
+11. **A replaced slot does not give the graph a fresh build would.**
+    `insert_replacing` reuses a deleted element's slot and its links as a
+    starting point. `hnswgraph.drift` says how far the index has moved from
+    a fresh build, and past about half of it a rebuild wins.
+12. **An index refuses a duplicate label**, and it refuses a vector of the
+    wrong length, one holding a value that is not a number, and a zero
+    vector under cosine.
+13. **Capacity is raised explicitly.** An insert past `capacity` is
+    `HnswAtCapacity` rather than a silent reallocation, and
+    `hnswgraph.grow` is the call. The copy is the expensive thing this
+    structure does, and hiding it would hide the cost of having sized the
+    index wrong.
+14. **Search an index under the parameters it was built with.** They are
+    fixed at construction and serialised with the index, because every one
+    of them shaped the graph.
+15. **A stored index is not hnswlib's file.** hnswlib writes its own memory
+    with no magic, no version and no dimension, so a file read by the wrong
+    build produces an index rather than an error. `hnswio` writes a magic,
+    a version and every parameter at a stated width and byte order, and
+    `from_bytes` runs `hnswgraph.check` before it answers. A corrupt HNSW
+    does not crash: it answers, worse.
+16. **Stored vectors are 64-bit floats.** A million 768-element vectors is
+    6 GB. Writing them narrower would round every vector on the way out and
+    produce an index that is not the one that was saved. A caller that
+    minds quantises before inserting, or keeps the vectors outside the
+    index and stores identifiers alone.
 
-`core`, and every effect row in the package is empty.
+## What is not included
 
-**No `@tier(embedded)` claim.**  An index of any useful size is
-megabytes of heap, the construction allocates, and the consumer is a
-server or a notebook.  The audit's `core-embedded` row passes and says
-the package makes no claim.
+- **Randomness.** The uniform is a parameter. The entropy comes from the
+  machine, and this package reaches nothing that touches it.
+- **Threads.** An index is a value, so a caller that wants two searches at
+  once hands the same value to both.
+- **A file.** `hnswio` answers bytes and takes bytes. Writing them down is
+  the caller's.
+- **Quantised storage.** `HnswIndex.data` is a list of 64-bit floats.
+  Storing vectors as bytes or bits, which is where usearch gets most of its
+  memory advantage, would be a different field. The metric enum has room
+  for another variant; the storage does not.
+- **A memory-mapped index.** Reading a stored index without loading it
+  needs machine effects. [vectorstore-nv](https://novo-lang.org/packages/vectorstore-nv)
+  is the package that owns those.
+- **A user-defined metric.** The three above are the ones the graph is
+  defined over here.
+- **A microcontroller build.** No module is declared to build for a device
+  with no heap allocator. An index of any useful size is megabytes of heap.
 
-## Naming
+## Related packages
 
-Every public type and every enum variant starts `Hnsw`, and every module
-file starts `hnsw`.  Struct and enum identity is keyed by **name** across
-a whole assembly, dependencies included, so two packages that both
-declare `Metric` cannot be used by one program.  The rule covers variant
-names, which is why the metrics are `HnswL2` and `HnswCosine` rather
-than the bare nouns — embeddings-nv computes the same three distances
-and would collide on every one of them.
+- [embeddings-nv](https://novo-lang.org/packages/embeddings-nv) produces
+  the vectors an index holds: pooling, normalisation, Matryoshka truncation
+  and quantisation. It speaks `NdFloat`, because its subject is a
+  token-embedding matrix. This package takes a row as a `[Float]`, because
+  its subject is a graph over rows of one dimension it already knows.
+  `ndfloat.to_list` of one row is the seam. The two packages compute the
+  same three distances and share no code.
+- [vectorstore-nv](https://novo-lang.org/packages/vectorstore-nv) keeps
+  documents beside their vectors, writes them down and serves them. It is
+  the host layer an index like this one sits inside.
+- [ndarray-nv](https://novo-lang.org/packages/ndarray-nv) is the
+  n-dimensional array. This package does not depend on it, so a program
+  that wants an index does not download an array library to get one.
+- `std.store` in the standard library is an in-memory vector store for
+  retrieval-augmented generation. It compares every vector, which is the
+  right thing up to a few thousand of them and the wrong thing past that.
+- `std.vec` in the standard library is dot, cosine and norm over a list of
+  floats, for a caller doing its own arithmetic on a handful of vectors.
 
-## What is the algorithm, and what is this package's choice
+## Tests
 
-**Malkov and Yashunin's paper and hnswlib, and binding**: the level
-formula and its `1 / ln(M)` multiplier; `2M` links at level 0 and `M`
-above; `ef_construction` during a build and `ef` during a search; the
-greedy descent with `ef = 1` through the upper levels; the neighbour
-heuristic; and delete-by-mark with slot replacement.
+```bash
+novo test tests/hnswdist_tests.nv    # 7 tests: the three metrics and the vector helpers
+novo test tests/hnswindex_tests.nv   # 8 tests: insertion, search, deletion, the file
+```
 
-**This package's choice**: the uniform as an argument (the layer's
-doing, and reproducibility is the compensation); `[Float]` rows;
-refusing `ef < k` rather than returning short; refusing a zero vector
-under cosine rather than picking a number; refusing a duplicate label;
-a magic and a version on the serialised form; running the graph check
-on every read; and making `search_layer` public, because it is the
-algorithm and a caller doing something the top-level API does not cover
-should not have to write it again.
+The distances are computed by hand and written out beside each assertion.
+The level formula is the paper's, with four uniforms chosen to land in the
+first four levels. The uniforms are written down rather than drawn, which
+is what the design buys: the graph is the same on every machine and every
+run, so an assertion about an edge is an assertion rather than a flake.
 
-## The reference implementation
+hnswlib is the oracle, and it arrives with the bodies: the same vectors,
+the same parameters and the same level sequence, compared edge for edge,
+with recall@10 over the SIFT1M and GIST1M query sets compared at four
+values of `ef`.
 
-[hnswlib](https://github.com/nmslib/hnswlib), and Malkov and Yashunin,
-*Efficient and robust approximate nearest neighbor search using
-Hierarchical Navigable Small World graphs* (2018).
-[usearch](https://github.com/unum-cloud/usearch) is the second reading,
-and the section above says where the two designs part.
+The tests compile today and fail at run, each on the
+`not implemented: hnsw-nv.<module>.<fn>` panic that is its body. That is
+the expected state of an interface release. They turn green one at a time
+as bodies land.
 
-The oracle arrives with the bodies: hnswlib built over the same vectors
-with the same parameters and the same recorded level sequence, its graph
-compared edge for edge, and recall@10 over the SIFT1M and GIST1M query
-sets compared at four values of `ef`, as a generated run beside the two
-suites in `tests/`.
+## Implementation status
 
-Apache-2.0.
+| Item | Implemented |
+| --- | --- |
+| `hnswdist.metric_name`, `.metric_of_name`, `.metric_code`, `.metric_of_code`, `.wants_normalized` | no |
+| `hnswdist.distance`, `.l2_squared`, `.l2`, `.cosine`, `.inner`, `.dot` | no |
+| `hnswdist.norm`, `.normalize`, `.is_finite_vector` | no |
+| `hnswparam.params`, `.default_params`, `.with_level_multiplier`, `.with_capacity` | no |
+| `hnswparam.default_level_multiplier`, `.level_of`, `.max_links`, `.default_ef` | no |
+| `hnswparam.element_bytes`, `.expected_at_level` | no |
+| `hnswgraph.index`, `.count`, `.live_count`, `.deleted_count`, `.params_of` | no |
+| `hnswgraph.insert`, `.insert_at_level`, `.insert_replacing`, `.grow` | no |
+| `hnswgraph.mark_deleted`, `.unmark_deleted`, `.is_deleted` | no |
+| `hnswgraph.slot_of`, `.label_at`, `.vector_of`, `.vector_base`, `.level_of_label` | no |
+| `hnswgraph.link_base`, `.neighbours`, `.degree`, `.level_histogram`, `.check`, `.drift` | no |
+| `hnswsearch.search`, `.search_default`, `.search_filtered` | no |
+| `hnswsearch.search_layer`, `.greedy_step`, `.brute_force`, `.distance_to` | no |
+| `hnswsearch.recall_at`, `.hit_labels`, `.expected_comparisons` | no |
+| `hnswio.magic_le`, `.format_version`, `.supported_versions`, `.header_bytes` | no |
+| `hnswio.size_bound`, `.to_bytes`, `.write_into` | no |
+| `hnswio.peek_header`, `.from_bytes`, `.is_index`, `.header_matches` | no |
+| `hnswerr.is_usage`, `.is_format`, `HnswFault.message` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

@@ -1,6 +1,6 @@
 [package]
 name        = "hnsw-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Hierarchical Navigable Small World: an approximate nearest-neighbour index as a VALUE.  Build parameters, insert with the level the caller's own randomness chose, k-nearest search with ef, three distance metrics, delete by mark with slot reuse, and a versioned serialised form written into a caller's buffer and read back.  No threads, no file, no clock and no entropy — the RNG arrives as one uniform per insert, because a `core` package may not reach a `host` one.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
