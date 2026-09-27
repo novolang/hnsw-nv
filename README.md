@@ -11,12 +11,6 @@ searched, copied, written out and read back, and nothing in it is a handle.
 The reference implementation is
 [hnswlib](https://github.com/nmslib/hnswlib).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What HNSW is
 
 An **element** is one vector with a **label**, an identifier the caller
@@ -32,7 +26,7 @@ it reaches level 0 it is already near the answer.
 
 Which level an element joins is drawn at random from a geometric
 distribution: `floor(-ln(u) * mL)`, where `u` is a uniform random number in
-[0, 1) and `mL` is the **level multiplier**. The paper recommends
+(0, 1) and `mL` is the **level multiplier**. The paper recommends
 `mL = 1 / ln(M)`, which makes the expected work per query grow with the
 logarithm of the number of elements.
 
@@ -111,11 +105,6 @@ fn main() [io]
                 println("${h.label} at ${h.distance}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented: hnsw-nv.<module>.<fn>`
-panic. The tests are the specification the implementation will have to
-satisfy.
-
 ## What the package contains
 
 | Module | Contents |
@@ -157,17 +146,18 @@ it. `from_bytes` reads the whole thing.
 ## The rules a user needs
 
 1. **The uniform is yours, and it is the whole of the randomness HNSW
-   needs.** `hnswgraph.insert` takes one number in [0, 1) per element, and
-   `hnswparam.level_of` applies the paper's Algorithm 1 formula
-   `floor(-ln(u) * mL)`. A build is therefore a pure function of the
-   vectors and the uniform sequence: the same inputs build the same graph
-   on any machine. A caller with a random number generator passes
-   `rng.next_float()`.
-2. **An index is a value and every call answers a new one.** Writing
-   `ix = hnswgraph.insert(ix, id, v, u)!` in a loop lets the runtime update
-   in place, because the caller holds the only reference. A caller that
-   keeps the old index gets a real copy, which is what makes a snapshot and
-   a rollback possible.
+   needs.** `hnswgraph.insert` takes one number strictly between 0 and 1
+   per element, and `hnswparam.level_of` applies the paper's Algorithm 1
+   formula `floor(-ln(u) * mL)`. 0.0 is refused, because its logarithm is
+   not finite, and so is 1.0. A build is therefore a pure function of the
+   vectors and the uniform sequence: the same inputs build the same graph,
+   byte for byte, on any machine. A caller whose generator can answer 0.0
+   passes `1.0 - u`.
+2. **An index is a value and every call answers a new one.** Nothing a
+   caller holds is changed, which is what makes a snapshot and a rollback
+   possible. The price is that every insert and every mark copies the
+   index's lists, so building an index of `n` elements costs time in
+   proportion to `n` squared on top of the searches.
 3. **Smaller is nearer, everywhere in this package.** The two
    similarity-shaped metrics are stored as `1 - similarity`, so every
    comparison is a minimum. `embeddings-nv` uses the opposite convention
@@ -205,9 +195,11 @@ it. `from_bytes` reads the whole thing.
     repairing the cut means re-running the neighbour selection for
     everything that pointed at it.
 11. **A replaced slot does not give the graph a fresh build would.**
-    `insert_replacing` reuses a deleted element's slot and its links as a
-    starting point. `hnswgraph.drift` says how far the index has moved from
-    a fresh build, and past about half of it a rebuild wins.
+    `insert_replacing` reuses a deleted element's slot, keeps that slot's
+    level, and chooses the slot's links again from its old ones as a
+    starting point, as hnswlib's `replace_deleted` does.
+    `hnswgraph.drift` says how far the index has moved from a fresh build,
+    and past about half of it a rebuild wins.
 12. **An index refuses a duplicate label**, and it refuses a vector of the
     wrong length, one holding a value that is not a number, and a zero
     vector under cosine.
@@ -224,7 +216,8 @@ it. `from_bytes` reads the whole thing.
     build produces an index rather than an error. `hnswio` writes a magic,
     a version and every parameter at a stated width and byte order, and
     `from_bytes` runs `hnswgraph.check` before it answers. A corrupt HNSW
-    does not crash: it answers, worse.
+    does not crash: it answers, worse. The module comment of `hnswio`
+    lays out every field.
 16. **Stored vectors are 64-bit floats.** A million 768-element vectors is
     6 GB. Writing them narrower would round every vector on the way out and
     produce an index that is not the one that was saved. A caller that
@@ -275,48 +268,33 @@ it. `from_bytes` reads the whole thing.
 ## Tests
 
 ```bash
-novo test tests/hnswdist_tests.nv    # 7 tests: the three metrics and the vector helpers
-novo test tests/hnswindex_tests.nv   # 8 tests: insertion, search, deletion, the file
+novo test tests/hnswdist_tests.nv     # the three metrics, the parameters, the level formula
+novo test tests/hnswindex_tests.nv    # insertion, search, deletion, the file
+novo test tests/hnswrecall_tests.nv   # recall and the construction's invariants
+novo test tests/hnswedges_tests.nv    # every refusal, and every corruption check
+bash tests/coverage.sh                 # line coverage over src/
 ```
 
 The distances are computed by hand and written out beside each assertion.
 The level formula is the paper's, with four uniforms chosen to land in the
-first four levels. The uniforms are written down rather than drawn, which
-is what the design buys: the graph is the same on every machine and every
-run, so an assertion about an edge is an assertion rather than a flake.
+first four levels. The uniforms are written down rather than drawn, so the
+graph is the same on every machine and every run, and an assertion about
+an edge is an assertion rather than a flake.
 
-hnswlib is the oracle, and it arrives with the bodies: the same vectors,
-the same parameters and the same level sequence, compared edge for edge,
-with recall@10 over the SIFT1M and GIST1M query sets compared at four
-values of `ef`.
+The recall reference is the exact answer, `hnswsearch.brute_force`. Over
+2,000 uniform random vectors of 24 coordinates, built at M 12 and
+`ef_construction` 100, recall@10 averaged over forty queries is at least
+0.95 at `ef` 64, and the suite asserts that bar. At `ef` 10 the same
+queries find about three quarters. A cosine index of 400 vectors clears
+the same bar, and an index with a tenth of its elements marked, or
+replaced, or searched under a filter, clears 0.9.
 
-The tests compile today and fail at run, each on the
-`not implemented: hnsw-nv.<module>.<fn>` panic that is its body. That is
-the expected state of an interface release. They turn green one at a time
-as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `hnswdist.metric_name`, `.metric_of_name`, `.metric_code`, `.metric_of_code`, `.wants_normalized` | no |
-| `hnswdist.distance`, `.l2_squared`, `.l2`, `.cosine`, `.inner`, `.dot` | no |
-| `hnswdist.norm`, `.normalize`, `.is_finite_vector` | no |
-| `hnswparam.params`, `.default_params`, `.with_level_multiplier`, `.with_capacity` | no |
-| `hnswparam.default_level_multiplier`, `.level_of`, `.max_links`, `.default_ef` | no |
-| `hnswparam.element_bytes`, `.expected_at_level` | no |
-| `hnswgraph.index`, `.count`, `.live_count`, `.deleted_count`, `.params_of` | no |
-| `hnswgraph.insert`, `.insert_at_level`, `.insert_replacing`, `.grow` | no |
-| `hnswgraph.mark_deleted`, `.unmark_deleted`, `.is_deleted` | no |
-| `hnswgraph.slot_of`, `.label_at`, `.vector_of`, `.vector_base`, `.level_of_label` | no |
-| `hnswgraph.link_base`, `.neighbours`, `.degree`, `.level_histogram`, `.check`, `.drift` | no |
-| `hnswsearch.search`, `.search_default`, `.search_filtered` | no |
-| `hnswsearch.search_layer`, `.greedy_step`, `.brute_force`, `.distance_to` | no |
-| `hnswsearch.recall_at`, `.hit_labels`, `.expected_comparisons` | no |
-| `hnswio.magic_le`, `.format_version`, `.supported_versions`, `.header_bytes` | no |
-| `hnswio.size_bound`, `.to_bytes`, `.write_into` | no |
-| `hnswio.peek_header`, `.from_bytes`, `.is_index`, `.header_matches` | no |
-| `hnswerr.is_usage`, `.is_format`, `HnswFault.message` | no |
+The construction is checked against the paper's invariants: every link
+count within `M` or `2 * M`, every link to an element that has that
+level, the entry point on the top level, every element reachable from it
+at level 0, and a level histogram within the spread `1/M` thinning
+predicts. Two builds from the same vectors and uniforms serialise to the
+same bytes, and a serialised index reads back equal field by field.
 
 ## Licence
 

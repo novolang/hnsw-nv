@@ -4,6 +4,66 @@ Every published version, newest first.  This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.1: the
+paper's insert and search with hnswlib's neighbour heuristic, delete by
+mark with slot reuse, the three metrics, and a checked serialised form.
+
+### Changed, breaking
+
+- `HnswIndex` gains two fields.  `link_starts` holds where each
+  element's run of links starts, so an element's links take room for
+  its own levels only.  `replaced` counts the slots `insert_replacing`
+  has reused, which `drift` reads.  A caller building an `HnswIndex`
+  literal adds both.
+- `hnswio.write_into` takes its buffer as `var into`.  Under 0.13.0's
+  list rule a function writes into a caller's buffer only through a
+  `var` parameter.
+- A uniform of 0.0 is refused as well as 1.0: the interval is (0, 1),
+  as `level_of`'s comment already said of 0.0.
+
+### Behaviour the interface left open
+
+- The insert is Algorithm 1 of Malkov and Yashunin with hnswlib's
+  `getNeighborsByHeuristic2` as the neighbour selection: `M` links for
+  the new element at every level, and a full neighbour keeping the best
+  of its links and the new one by the same heuristic.  Marked elements
+  are walked through during an insert and not linked to, as in hnswlib.
+- The search at level 0 keeps walking while it holds fewer than `ef`
+  accepted answers, as hnswlib's `searchBaseLayerST` does, so a filter
+  or a mark does not shorten a result while enough accepted elements are
+  reachable.  Ties are broken by slot everywhere.
+- `insert_replacing` keeps the reused slot's level, as hnswlib's
+  `updatePoint` does, and reuses a marked slot carrying the same label
+  before any other.
+- `check` does not require links to be reciprocal, since the neighbour
+  heuristic removes back-links; it checks lengths, levels, run starts,
+  counts, targets and labels, and names each.
+- `drift` is `(marked + replaced) / count`, at most 1.0.
+- `expected_at_level` is `count * exp(-level / mL)`, which is
+  `count * M^-level` at the default multiplier.
+- `element_bytes` is the element's cost in the serialised form.
+- `expected_comparisons` is the mean degree at each upper level plus
+  `ef` times the mean degree at level 0.
+- The serialised form is laid out in `hnswio`'s module comment: a
+  48-byte header with the magic "NVHW", then the fixed fields, the
+  vectors as 64-bit floats and the graph.  `from_bytes` checks every
+  size against the total before it reads, and runs `check`.
+- `metric_of_code` answers `HnswBadParam` naming "metric" for an
+  unknown code.
+
+### Tests
+
+- 27 tests in four suites.  The exact answer is the recall reference:
+  recall@10 of at least 0.95 at `ef` 64 over 2,000 seeded vectors of 24
+  coordinates, and at least 0.9 with marks, replacements and a filter.
+  The paper's invariants are asserted over the same build, two builds
+  from the same uniforms serialise to the same bytes, and every
+  corruption `check` and `from_bytes` look for is refused by name.
+- Every line under `src/` is executed by the suites;
+  `bash tests/coverage.sh` prints the number.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
