@@ -1,29 +1,16 @@
-// hnswdist_tests.nv — the API suite for the three distances and the
-// build parameters: the sign convention, the squared L2, the level
-// formula, and the bounds every parameter is checked against.
+// hnswdist_tests.nv — the three distances and the build parameters: the
+// sign convention, the squared L2, the level formula, and the bounds
+// every parameter is checked against.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: hnsw-nv.<module>.<fn>`.
+// The distances are arithmetic, worked by hand: `[0, 0]` to `[3, 4]` is
+// the 3-4-5 triangle, so the squared L2 is 25 and the L2 is 5; `[1, 0]`
+// against `[0, 1]`, `[1, 0]` and `[-1, 0]` gives the three corners of
+// cosine's range; `[1, 2, 3]` against `[4, 5, 6]` is 32.
 //
-// WHERE THE NUMBERS COME FROM.  The distances are arithmetic and the
-// suite computes them by hand: `[0, 0]` to `[3, 4]` is the 3-4-5
-// triangle, so the squared L2 is 25 and the L2 is 5; `[1, 0]` against
-// `[0, 1]`, `[1, 0]` and `[-1, 0]` gives the three corners of cosine's
-// range; `[1, 2, 3]` against `[4, 5, 6]` is 32, which is the dot
-// product every textbook uses.
-//
-// The level formula is the paper's — Malkov and Yashunin, algorithm 1,
-// `l = floor(-ln(unif(0,1)) * mL)` — with `mL = 1 / ln(M)`, which is
-// the same paper's recommendation and hnswlib's default.  At M 16 that
-// multiplier is 0.36067, and the four uniforms below were chosen to
-// land one in each of the first four levels.
-//
-// THE REFERENCE IMPLEMENTATION IS THE ORACLE for the parts that are not
-// arithmetic, and it arrives beside this file as a generated run when
-// the bodies land: hnswlib built over the same vectors with the same
-// parameters and the same recorded level sequence, its graph compared
-// with this one's edge for edge, and its recall compared on the SIFT
-// and GIST query sets.
+// The level formula is Algorithm 1 of Malkov and Yashunin,
+// `l = floor(-ln(u) * mL)`, with the same paper's `mL = 1 / ln(M)`.  At
+// M 16 that multiplier is 0.36067, and the four uniforms below land one
+// in each of the first four levels.
 
 use std.test
 use hnswdist
@@ -60,7 +47,7 @@ fn test_everything_here_is_a_distance_and_smaller_is_nearer() [io]
         Ok(d)  => test.assert_approx(d, 32.0, 0.000001)
         Err(f) => test.fail(f.message())
 
-    test.case("and inner-product DISTANCE is one minus it, so it may be negative")
+    test.case("and inner-product distance is one minus it, so it may be negative")
     // -31, and that is not a bug.  An inner-product index over
     // unnormalised vectors has distances below zero and does not obey
     // the triangle inequality; hnswlib makes the same choice, and the
@@ -177,7 +164,7 @@ fn test_the_level_formula_is_the_papers_and_the_uniform_is_the_callers() [io]
         Ok(l)  => test.assert(l == 3)
         Err(f) => test.fail(f.message())
 
-    test.case("a uniform outside [0, 1) is a fault and never a clamp")
+    test.case("a uniform outside (0, 1) is a fault and never a clamp")
     // A clamped 1.0 puts every element on level 0, and an index built
     // that way is a linked list that answers every query by scanning
     // it — a failure with no symptom but latency.

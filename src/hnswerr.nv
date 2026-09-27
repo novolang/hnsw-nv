@@ -1,20 +1,14 @@
 // hnswerr.nv — what an index could not do, and the numbers that say
 // why.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// THE FAULTS SPLIT INTO THREE GROUPS AND THE MESSAGE SAYS WHICH.  A
-// parameter the caller chose (`HnswBadParam`, `HnswBadUniform`), a
-// vector that does not fit the index it was handed to
-// (`HnswDimMismatch`, `HnswNotFinite`), and a lookup that found
-// nothing (`HnswNoSuchLabel`, `HnswEmptyIndex`).  The first group is a
-// bug in the calling code, the second is a bug in the pipeline that
-// produced the vector, and the third is ordinary.
-//
-// `is_usage` is that split made callable, because the three want
-// different handling: a usage fault should stop a program, a data
-// fault should be counted and the row skipped, and a lookup fault is
-// often just an answer.
+// The faults fall into groups a caller handles differently.  A
+// parameter or a vector the caller chose (`HnswBadParam`,
+// `HnswBadUniform`, `HnswDimMismatch`, `HnswNotFinite`, `HnswZeroNorm`,
+// `HnswDuplicateLabel`) is a bug in the calling code, and `is_usage`
+// says so.  A lookup that found nothing, an empty index, a full index
+// and a buffer too small are answers a correct program meets.  The four
+// faults of reading a serialised index are a file to discard, and
+// `is_format` says so.
 
 // What an index refused, and the numbers that made it refuse.
 //
@@ -27,56 +21,42 @@
 // ```
 pub enum HnswFault
     // A build parameter outside its range.  `what` names it — "M",
-    // "ef_construction", "dim", "ef" — and `value` is what was asked
-    // for.  Every bound is in `hnswparam`, and each is a bound for a
-    // reason the page gives rather than a number somebody liked.
+    // "ef_construction", "dim", "ef", "k", "level", "capacity",
+    // "level_multiplier" — and `value` is what was asked for, or 0 for
+    // the level multiplier, which is not an integer.
     HnswBadParam(what: Str, value: Int)
-    // The uniform handed to an insert was not in [0, 1).  A fault
-    // rather than a clamp: the number decides which level an element
-    // is inserted at, a clamped 1.0 puts every element on level 0, and
-    // an index built that way is a linked list that answers every
-    // query by scanning it.
+    // The uniform handed to an insert was not in (0, 1).  A fault rather
+    // than a clamp: the number decides which level an element is
+    // inserted at, and a clamped 1.0 puts every element on level 0.
     HnswBadUniform(value: Float)
-    // A vector of the wrong length.  The commonest fault there is, and
-    // almost always one model's output handed to an index built for
-    // another's — 768 against 384 is `all-mpnet` against `all-MiniLM`.
+    // A vector of the wrong length.  Usually one model's output handed
+    // to an index built for another's: 768 against 384 is `all-mpnet`
+    // against `all-MiniLM`.
     HnswDimMismatch(want: Int, got: Int)
     // A vector holding a value that is not finite.  `at` is the
-    // coordinate.  Refused rather than stored, because one NaN in an
-    // index poisons every comparison it takes part in: a distance to
-    // NaN is NaN, NaN sorts unpredictably, and the graph that gets
-    // built has edges nobody can explain.
+    // coordinate.  Refused rather than stored, because a distance to
+    // NaN is NaN and NaN sorts unpredictably.
     HnswNotFinite(at: Int)
-    // A vector of all zeros handed to a cosine index.  Cosine is
-    // undefined there — the norm is zero and the division is not — and
-    // the alternatives are worse than a fault: 0.0 makes it maximally
-    // similar to everything and 1.0 makes it maximally distant from
-    // everything, and both are wrong in a way that shows up as bad
-    // results rather than as an error.
+    // A vector of all zeros handed to a cosine index or to `normalize`.
+    // Its norm is zero, so its cosine is undefined.
     HnswZeroNorm
     // A label no element in the index carries.
     HnswNoSuchLabel(label: Int)
     // A label an element already carries, on an insert.  Labels are
-    // the caller's own ids and this package does not pick them, so a
-    // repeat is a caller that lost track — and silently replacing
-    // would leave the old vector's edges in the graph, pointing at a
-    // row that means something else.
+    // the caller's own ids, so a repeat is a caller that lost track, and
+    // replacing silently would leave the old vector's edges in the
+    // graph.
     HnswDuplicateLabel(label: Int)
-    // A search of an index with nothing in it.  Not a corruption, and
-    // `is_usage` answers false: an empty result would be a defensible
-    // answer, and this is the more useful one because the usual cause
-    // is a build that silently failed upstream.
+    // A search of an index with nothing in it.  The usual cause is a
+    // build that failed upstream, so it is a fault rather than an empty
+    // answer, and `is_usage` answers false.
     HnswEmptyIndex
     // An index that has reached the capacity it was built with.
     // `hnswparam.HnswParams.capacity` is the number, and
     // `hnswgraph.grow` is what raises it.
     HnswAtCapacity(capacity: Int)
     // A serialised index whose first bytes are not this format's.
-    // `got` is the little-endian reading of the four magic bytes, so a
-    // caller who handed over an hnswlib `.bin` sees a number they can
-    // recognise rather than a shrug — and hnswlib's own file is a raw
-    // memory dump with no magic at all, which is exactly why this
-    // format has one.
+    // `got` is the little-endian reading of the first four bytes.
     HnswBadMagic(got: Int)
     // A serialised index from a version of this format that this
     // package does not read.  `hnswio.format_version` is what it
@@ -87,26 +67,21 @@ pub enum HnswFault
     HnswTruncated(at: Int, want: Int)
     // A serialised index that read back inconsistent: a neighbour
     // index off the end, a level above the top, a link count above
-    // the parameter.  `what` names the field.  The check is worth
-    // making because the graph is the only part a corrupt file can
-    // damage in a way that produces answers rather than a crash.
+    // the parameter.  `what` names the field and `at` the element or
+    // the position.
     HnswCorruptGraph(what: Str, at: Int)
-    // A writer was handed `room` bytes and needed `want`.  Answers
-    // FALSE to `is_usage`: a buffer too small is a sizing decision,
-    // and `hnswio.size_bound` is the number to have asked for.
+    // A writer was handed `room` bytes and needed `want`.  A sizing
+    // decision, so `is_usage` answers false; `hnswio.size_bound` is the
+    // number to ask for.
     HnswOutputFull(want: Int, room: Int)
 
-// The rule every `HnswFault` is printed by: name what was compared,
-// and print both sides.
-//
-// `Result<T, E>` requires `E: Error` (SPEC § 3.4), so this impl is what
-// makes every fallible signature in the package spellable — it exists
-// whether or not an interface release has anything to say yet.
+// Every `HnswFault` is printed the same way: it names what was
+// compared, and prints both sides.
 impl Error for HnswFault
     fn message(self) -> Str
         match self
             HnswBadParam(what, value)  => "${what} of ${value} is out of range"
-            HnswBadUniform(value)      => "a uniform of ${value} is not in [0, 1)"
+            HnswBadUniform(value)      => "a uniform of ${value} is not in (0, 1)"
             HnswDimMismatch(want, got) => "a vector of ${got} into an index of ${want}"
             HnswNotFinite(at)          => "coordinate ${at} is not a finite number"
             HnswZeroNorm               => "cosine distance is undefined for a zero vector"
@@ -123,11 +98,10 @@ impl Error for HnswFault
 // Whether the fault is a bug in the calling code rather than an
 // ordinary answer or a sizing decision.
 //
-// True for the parameter and vector faults and for a duplicate label;
-// false for `HnswNoSuchLabel`, `HnswEmptyIndex` and `HnswOutputFull`,
-// each of which a correct program meets.  The split a caller wants at
-// the top of a loop: stop on a usage fault, count and skip on a data
-// one.
+// True for the parameter and vector faults and for a duplicate label.
+// False for the lookup, the empty index, the full index and the full
+// buffer, which a correct program meets, and for the four format
+// faults.
 //
 // ```novo
 // use hnswerr
@@ -137,12 +111,24 @@ impl Error for HnswFault
 //     // : false
 // ```
 pub fn is_usage(f: HnswFault) -> Bool
-    todo("hnsw-nv.hnswerr.is_usage")
+    match f
+        HnswBadParam(_, _)    => true
+        HnswBadUniform(_)     => true
+        HnswDimMismatch(_, _) => true
+        HnswNotFinite(_)      => true
+        HnswZeroNorm          => true
+        HnswDuplicateLabel(_) => true
+        _                     => false
 
 // Whether the fault came from reading a serialised index.
 //
-// The four `hnswio` faults.  For a caller that loads an index from a
-// cache and rebuilds when it cannot: a load that fails this way is a
-// cache to discard, and anything else is a bug to report.
+// The four `hnswio` faults: `HnswBadMagic`, `HnswBadVersion`,
+// `HnswTruncated` and `HnswCorruptGraph`.  A load that fails this way is
+// a cache to discard.
 pub fn is_format(f: HnswFault) -> Bool
-    todo("hnsw-nv.hnswerr.is_format")
+    match f
+        HnswBadMagic(_)        => true
+        HnswBadVersion(_)      => true
+        HnswTruncated(_, _)    => true
+        HnswCorruptGraph(_, _) => true
+        _                      => false

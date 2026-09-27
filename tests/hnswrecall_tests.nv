@@ -1,0 +1,250 @@
+// hnswrecall_tests.nv — recall against the exact answer, and the
+// invariants of the paper's construction, over seeded random vectors.
+//
+// The exact k-nearest neighbours, `hnswsearch.brute_force`, are the
+// reference.  Recall@10 is the fraction of them a search finds, averaged
+// over the queries.  The bar is 0.95 at `ef` 64 over 1,200 vectors of 12
+// coordinates built at M 12 and `ef_construction` 100, which hnswlib
+// clears at these settings with room to spare.
+//
+// The vectors and the uniforms come from the Park and Miller "minimal
+// standard" generator, seeded, so every run builds the same graph.
+
+use std.test
+use std.list
+use hnswparam
+use hnswgraph
+use hnswsearch
+use hnswio
+
+// Park and Miller's generator: the state is in 1 ..= 2^31 - 2, so a
+// uniform drawn from it is strictly inside (0, 1).
+struct Rng
+    var state: Int
+
+fn uniform(var r: Rng) -> Float
+    r.state = r.state * 48271 % 2147483647
+    r.state as Float / 2147483647.0
+
+fn point(var r: Rng, dim: Int) -> [Float]
+    var v: [Float] = []
+    for _ in 0..dim
+        list.push(v, 2.0 * uniform(r) - 1.0)
+    v
+
+fn build(n: Int, dim: Int, metric: HnswMetric, seed: Int) -> Result<HnswIndex, HnswFault>
+    var r = Rng { state: seed }
+    let p = hnswparam.params(dim, metric, 12, 100, n)!
+    var ix = hnswgraph.index(p)
+    for i in 0..n
+        let v = point(r, dim)
+        ix = hnswgraph.insert(ix, i, v, uniform(r))!
+    Ok(ix)
+
+// Recall@k averaged over `queries` random queries.
+fn mean_recall(ix: HnswIndex, queries: Int, k: Int, ef: Int, seed: Int) -> Result<Float, HnswFault>
+    var r = Rng { state: seed }
+    var total = 0.0
+    for _ in 0..queries
+        let q = point(r, ix.params.dim)
+        let approx = hnswsearch.search(ix, q, k, ef)!
+        let exact = hnswsearch.brute_force(ix, q, k)!
+        total = total + hnswsearch.recall_at(approx, exact)
+    Ok(total / queries as Float)
+
+// The slots reachable from the entry point along level-0 links.
+fn reachable(ix: HnswIndex) -> Result<Int, HnswFault>
+    let n = hnswgraph.count(ix)
+    var seen = list.range(0, n) |> list.map(_ => false)
+    var frontier = [ix.entry]
+    seen[ix.entry] = true
+    var found = 1
+    for _ in 0..n
+        if list.len(frontier) == 0
+            break
+        var next: [Int] = []
+        for s in frontier
+            for x in hnswgraph.neighbours(ix, s, 0)!
+                if not seen[x]
+                    seen[x] = true
+                    found = found + 1
+                    list.push(next, x)
+        frontier = next
+    Ok(found)
+
+fn is_even_label(label: Int) -> Bool
+    label % 2 == 0
+
+// A test body that propagates a fault, reported as a failure.
+fn report(r: Result<Unit, HnswFault>) [io]
+    match r
+        Ok(_)  => ()
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_recall_clears_the_bar_against_the_exact_answer() [io]
+    report(recall_bar())
+
+fn recall_bar() -> Result<Unit, HnswFault> [io]
+    let ix = build(2000, 24, HnswL2, 12345)!
+
+    test.case("every element went in")
+    test.assert(hnswgraph.count(ix) == 2000)
+
+    test.case("recall@10 at ef 64 is at least 0.95")
+    let r64 = mean_recall(ix, 40, 10, 64, 777)!
+    test.assert(r64 >= 0.95)
+
+    test.case("and a larger ef never finds less over the same queries")
+    let r128 = mean_recall(ix, 40, 10, 128, 777)!
+    test.assert(r128 >= r64)
+
+    test.case("at ef 10 it is well below, which is what ef trades")
+    let r10 = mean_recall(ix, 40, 10, 10, 777)!
+    test.assert(r10 < 0.9 and r10 <= r128)
+    Ok(())
+
+@test
+fn test_the_construction_keeps_the_papers_invariants() [io]
+    report(invariants())
+
+fn invariants() -> Result<Unit, HnswFault> [io]
+    let ix = build(2000, 24, HnswL2, 12345)!
+    let p = hnswgraph.params_of(ix)
+
+    test.case("the graph checks: degrees within M and 2M, every link to a level its target has")
+    test.assert(hnswgraph.check(ix)! > 2000)
+
+    test.case("the entry point is on the top level")
+    test.assert(ix.levels[ix.entry] == ix.top_level)
+
+    test.case("level 0 is connected: every element is reachable from the entry point")
+    test.assert(reachable(ix)! == 2000)
+
+    test.case("the level histogram is geometric in 1/M")
+    // 2,000 elements at M 12: about 167 at level 1 or above, with a
+    // standard deviation of about 12.
+    let h = hnswgraph.level_histogram(ix)
+    test.assert(h[0] == 2000)
+    test.assert(h[1] > 130 and h[1] < 205)
+    let expected = hnswparam.expected_at_level(p, 2000, 1)
+    test.assert(expected > 166.6 and expected < 166.7)
+
+    test.case("the same vectors and uniforms build the same bytes")
+    let again = build(2000, 24, HnswL2, 12345)!
+    test.assert(hnswio.to_bytes(ix)! == hnswio.to_bytes(again)!)
+
+    test.case("the cost model grows with ef")
+    test.assert(hnswsearch.expected_comparisons(ix, 64) >
+                hnswsearch.expected_comparisons(ix, 16))
+    Ok(())
+
+@test
+fn test_a_cosine_index_ranks_by_angle() [io]
+    report(by_angle())
+
+fn by_angle() -> Result<Unit, HnswFault> [io]
+    let ix = build(400, 8, HnswCosine, 999)!
+    test.case("recall@10 at ef 64 over a cosine index")
+    test.assert(mean_recall(ix, 20, 10, 64, 31)! >= 0.95)
+
+    test.case("an inner-product index answers too")
+    let inner = build(200, 4, HnswInner, 5)!
+    test.assert(mean_recall(inner, 10, 5, 50, 17)! >= 0.9)
+    Ok(())
+
+@test
+fn test_deleted_elements_are_walked_through_and_never_answered() [io]
+    report(deletions())
+
+fn deletions() -> Result<Unit, HnswFault> [io]
+    var ix = build(600, 8, HnswL2, 4242)!
+    for i in 0..60
+        ix = hnswgraph.mark_deleted(ix, i * 10)!
+
+    test.case("sixty marks, and the graph still checks")
+    test.assert(hnswgraph.deleted_count(ix) == 60)
+    test.assert(hnswgraph.check(ix)! > 0)
+
+    test.case("no search answers a marked element, and recall stays above 0.9")
+    var r = Rng { state: 8 }
+    var answered_deleted = 0
+    var total = 0.0
+    for _ in 0..20
+        let q = point(r, 8)
+        let approx = hnswsearch.search(ix, q, 10, 64)!
+        for h in approx
+            if h.label % 10 == 0
+                answered_deleted = answered_deleted + 1
+        total = total + hnswsearch.recall_at(approx, hnswsearch.brute_force(ix, q, 10)!)
+    test.assert(answered_deleted == 0)
+    test.assert(total / 20.0 >= 0.9)
+
+    test.case("replacing the marked slots reuses them and the graph still checks")
+    var re = ix
+    var rr = Rng { state: 99 }
+    for i in 0..60
+        re = hnswgraph.insert_replacing(re, 1000 + i, point(rr, 8), uniform(rr))!
+    test.assert(hnswgraph.count(re) == 600)
+    test.assert(hnswgraph.deleted_count(re) == 0)
+    test.assert(hnswgraph.check(re)! > 0)
+    test.assert(hnswgraph.drift(re) > 0.09 and hnswgraph.drift(re) < 0.11)
+    test.assert(mean_recall(re, 20, 10, 64, 55)! >= 0.9)
+    Ok(())
+
+@test
+fn test_a_filter_is_applied_during_the_search() [io]
+    report(filtered())
+
+fn filtered() -> Result<Unit, HnswFault> [io]
+    let ix = build(600, 8, HnswL2, 777)!
+    var r = Rng { state: 3 }
+    var odd = 0
+    var short = 0
+    var total = 0.0
+    for _ in 0..20
+        let q = point(r, 8)
+        let hits = hnswsearch.search_filtered(ix, q, 10, 64, is_even_label)!
+        if list.len(hits) < 10
+            short = short + 1
+        for h in hits
+            if h.label % 2 != 0
+                odd = odd + 1
+        // The exact answer under the filter: the nearest ten even labels.
+        let all = hnswsearch.brute_force(ix, q, 600)!
+        let exact = all |> list.filter(h => h.label % 2 == 0)
+        total = total + hnswsearch.recall_at(hits, exact[0:10])
+
+    test.case("every answer passes the filter, and there are always ten")
+    test.assert(odd == 0)
+    test.assert(short == 0)
+
+    test.case("and recall against the filtered exact answer is above 0.9")
+    test.assert(total / 20.0 >= 0.9)
+    Ok(())
+
+@test
+fn test_a_large_index_reads_back_equal() [io]
+    report(round_trip())
+
+fn round_trip() -> Result<Unit, HnswFault> [io]
+    let ix = build(300, 6, HnswCosine, 21)!
+    let back = hnswio.from_bytes(hnswio.to_bytes(ix)!)!
+
+    test.case("every list and every number is equal")
+    test.assert(back.data == ix.data)
+    test.assert(back.labels == ix.labels)
+    test.assert(back.deleted == ix.deleted)
+    test.assert(back.levels == ix.levels)
+    test.assert(back.link_starts == ix.link_starts)
+    test.assert(back.links == ix.links)
+    test.assert(back.link_counts == ix.link_counts)
+    test.assert(back.entry == ix.entry and back.top_level == ix.top_level)
+    test.assert(back.params.level_multiplier == ix.params.level_multiplier)
+
+    test.case("so a search answers the same")
+    let q = [0.1, 0.2, 0.3, -0.4, 0.5, -0.6]
+    let a = hnswsearch.search(ix, q, 5, 20)!
+    let c = hnswsearch.search(back, q, 5, 20)!
+    test.assert(hnswsearch.hit_labels(a) == hnswsearch.hit_labels(c))
+    Ok(())

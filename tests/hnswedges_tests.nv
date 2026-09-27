@@ -1,0 +1,322 @@
+// hnswedges_tests.nv — every refusal, and a corrupt index or file for
+// each thing `hnswgraph.check` and `hnswio.from_bytes` look at.
+//
+// A corrupt index is built here by hand, as a struct literal with one
+// field wrong, and a corrupt file by writing one field of a good one
+// over.  Each must be refused with the fault that names that field.
+
+use std.test
+use std.list
+use std.bytes
+use std.float
+use std.math
+use hnswdist
+use hnswparam
+use hnswgraph
+use hnswsearch
+use hnswio
+use hnswerr
+
+fn report(r: Result<Unit, HnswFault>) [io]
+    match r
+        Ok(_)  => ()
+        Err(f) => test.fail(f.message())
+
+// Three points on a line, labelled 1 to 3, the middle one at level 1.
+fn small() -> Result<HnswIndex, HnswFault>
+    let p = hnswparam.params(1, HnswL2, 2, 4, 4)!
+    var ix = hnswgraph.index(p)
+    ix = hnswgraph.insert_at_level(ix, 1, [0.0], 0)!
+    ix = hnswgraph.insert_at_level(ix, 2, [1.0], 1)!
+    ix = hnswgraph.insert_at_level(ix, 3, [2.0], 0)!
+    Ok(ix)
+
+// `ix` with one of its fields replaced, for building a corrupt index.
+fn altered(ix: HnswIndex, levels: [Int], starts: [Int], links: [Int], counts: [Int], labels: [Int],
+           entry: Int, top: Int) -> HnswIndex
+    HnswIndex { params: ix.params, data: ix.data[:], labels: labels[:], deleted: ix.deleted[:],
+                levels: levels[:], link_starts: starts[:], links: links[:],
+                link_counts: counts[:], entry: entry, top_level: top, replaced: ix.replaced }
+
+// The name a corrupt-graph fault gives, or "" for any other answer.
+fn corrupt_field(r: Result<Int, HnswFault>) -> Str
+    match r
+        Err(f) =>
+            match f
+                HnswCorruptGraph(what, _) => what
+                _                         => ""
+        Ok(_)  => ""
+
+fn read_field(b: Bytes) -> Str
+    match hnswio.from_bytes(b)
+        Err(f) =>
+            match f
+                HnswCorruptGraph(what, _) => what
+                _                         => f.message()
+        Ok(_)  => "read"
+
+@test
+fn test_the_faults_print_and_sort_themselves() [io]
+    test.case("every message names both sides")
+    test.assert(HnswDimMismatch(768, 384).message() == "a vector of 384 into an index of 768")
+    test.assert(HnswNoSuchLabel(7).message() == "no element labelled 7")
+    test.assert(HnswDuplicateLabel(7).message() == "an element is already labelled 7")
+    test.assert(HnswEmptyIndex.message() == "an index with nothing in it")
+    test.assert(HnswBadMagic(5).message() == "not a serialised index: first four bytes read 5")
+    test.assert(HnswOutputFull(10, 4).message() == "10 byte(s) into room for 4")
+    test.assert(HnswBadParam("M", 1).message() == "M of 1 is out of range")
+    test.assert(HnswBadVersion(2).message() == "index format 2 is not one this reader knows")
+    test.assert(HnswTruncated(4, 44).message() == "44 more byte(s) wanted at 4")
+    test.assert(HnswCorruptGraph("links", 3).message() == "links at 3 does not describe this graph")
+
+    test.case("a bad vector is the caller's")
+    test.assert(hnswerr.is_usage(HnswNotFinite(0)))
+    test.assert(hnswerr.is_usage(HnswZeroNorm))
+    test.assert(hnswerr.is_usage(HnswBadUniform(1.0)))
+    test.assert(not hnswerr.is_usage(HnswAtCapacity(4)))
+    test.assert(not hnswerr.is_usage(HnswBadMagic(0)))
+    test.assert(not hnswerr.is_format(HnswEmptyIndex))
+
+@test
+fn test_the_metrics_by_name_and_by_code() [io]
+    test.case("every name and every code parses back")
+    test.assert(hnswdist.metric_of_name("l2") != None)
+    test.assert(hnswdist.metric_of_name("cosine") != None)
+    match hnswdist.metric_of_code(2)
+        Ok(m)  => test.assert(hnswdist.metric_name(m) == "inner")
+        Err(f) => test.fail(f.message())
+    match hnswdist.metric_of_code(0)
+        Ok(m)  => test.assert(hnswdist.metric_name(m) == "l2")
+        Err(f) => test.fail(f.message())
+
+    test.case("a coordinate that is not a number is refused at its position")
+    match hnswdist.distance(HnswL2, [0.0, 1.0], [0.0, math.nan()])
+        Ok(d)  => test.fail("a distance of ${d} to NaN")
+        Err(f) => test.assert(f.message() == "coordinate 1 is not a finite number")
+    test.assert(not hnswdist.is_finite_vector([1.0, math.infinity()]))
+    match hnswdist.norm([math.nan()])
+        Ok(n)  => test.fail("a norm of ${n}")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+
+    test.case("a level multiplier that is not positive is refused by level_of too")
+    match hnswparam.level_of(0.5, 0.0 - 1.0)
+        Ok(l)  => test.fail("a level ${l} at a negative multiplier")
+        Err(f) => test.assert(f.message() == "level_multiplier of 0 is out of range")
+    match hnswparam.with_level_multiplier(fallback(), math.infinity())
+        Ok(_)  => test.fail("an infinite multiplier")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+    test.assert(hnswparam.default_level_multiplier(1) == hnswparam.default_level_multiplier(2))
+
+// Parameters written out, for a check that needs no index.
+fn fallback() -> HnswParams
+    HnswParams { dim: 2, metric: HnswL2, m: 16, ef_construction: 200, capacity: 1024,
+                 level_multiplier: 0.36 }
+
+@test
+fn test_a_query_is_checked_like_a_vector() [io]
+    report(queries())
+
+fn queries() -> Result<Unit, HnswFault> [io]
+    let ix = small()!
+    test.case("a NaN query is refused at its position")
+    match hnswsearch.search(ix, [math.nan()], 1, 4)
+        Ok(_)  => test.fail("a search for NaN")
+        Err(f) => test.assert(f.message() == "coordinate 0 is not a finite number")
+
+    test.case("a zero query into a cosine index is refused")
+    let cos = hnswgraph.insert(hnswgraph.index(hnswparam.params(2, HnswCosine, 2, 4, 4)!), 1,
+                               [1.0, 0.0], 0.5)!
+    match hnswsearch.search(cos, [0.0, 0.0], 1, 4)
+        Ok(_)  => test.fail("a search for a zero vector under cosine")
+        Err(f) => test.assert(f.message() == "cosine distance is undefined for a zero vector")
+
+    test.case("search_layer needs an ef of one or more, and a level its entry has")
+    match hnswsearch.search_layer(ix, [0.5], 0, 0, 0)
+        Ok(_)  => test.fail("a walk at ef 0")
+        Err(f) => test.assert(f.message() == "ef of 0 is out of range")
+    match hnswsearch.search_layer(ix, [0.5], 0, 2, 1)
+        Ok(_)  => test.fail("a walk at a level slot 0 does not have")
+        Err(f) => test.assert(f.message() == "level of 1 is out of range")
+    match hnswsearch.search_layer(ix, [0.5], 9, 2, 0)
+        Ok(_)  => test.fail("a walk from a slot that is not there")
+        Err(f) => test.assert(not hnswerr.is_usage(f))
+
+    test.case("brute force refuses what search refuses")
+    match hnswsearch.brute_force(ix, [0.5], 0)
+        Ok(_)  => test.fail("an exact answer of none")
+        Err(f) => test.assert(hnswerr.is_usage(f))
+    let empty = hnswgraph.index(hnswgraph.params_of(ix))
+    match hnswsearch.brute_force(empty, [0.5], 1)
+        Ok(_)  => test.fail("an exact answer out of nothing")
+        Err(f) => test.assert(not hnswerr.is_usage(f))
+
+    test.case("a label that is not there has no distance")
+    match hnswsearch.distance_to(ix, [0.5], 99)
+        Ok(d)  => test.fail("a distance of ${d} to nothing")
+        Err(f) => test.assert(f.message() == "no element labelled 99")
+
+    test.case("an empty index has not drifted and costs nothing")
+    test.assert(hnswgraph.drift(empty) == 0.0)
+    test.assert(hnswsearch.expected_comparisons(empty, 10) == 0.0)
+    test.assert(list.len(hnswgraph.level_histogram(empty)) == 0)
+    test.assert(hnswgraph.check(empty)! == 0)
+
+    test.case("a slot out of range is not an element")
+    match hnswgraph.label_at(ix, 3)
+        Ok(l)  => test.fail("label ${l} at slot 3 of 3")
+        Err(f) => test.assert(f.message() == "no element labelled 3")
+    Ok(())
+
+@test
+fn test_replacing_reuses_a_mark_and_otherwise_inserts() [io]
+    report(replacing())
+
+fn replacing() -> Result<Unit, HnswFault> [io]
+    let ix = small()!
+
+    test.case("with no mark to reuse, a replacing insert is an insert")
+    let four = hnswgraph.insert_replacing(ix, 4, [3.0], 0.5)!
+    test.assert(hnswgraph.count(four) == 4)
+    test.assert(hnswgraph.drift(four) == 0.0)
+
+    test.case("a live label is still a duplicate")
+    match hnswgraph.insert_replacing(ix, 2, [5.0], 0.5)
+        Ok(_)  => test.fail("label 2 inserted twice")
+        Err(f) => test.assert(f.message() == "an element is already labelled 2")
+
+    test.case("a marked slot carrying the same label is the one reused")
+    let marked = hnswgraph.mark_deleted(ix, 2)!
+    let back = hnswgraph.insert_replacing(marked, 2, [1.5], 0.5)!
+    test.assert(hnswgraph.slot_of(back, 2) == Some(1))
+    test.assert(hnswgraph.level_of_label(back, 2)! == 1)
+    test.assert(hnswgraph.vector_of(back, 2)! == [1.5])
+    test.assert(hnswgraph.check(back)! > 0)
+    test.assert(hnswgraph.drift(back) > 0.33 and hnswgraph.drift(back) < 0.34)
+
+    test.case("drift is at most 1, however many marks and reuses there are")
+    var all = back
+    for label in [1, 2, 3]
+        all = hnswgraph.mark_deleted(all, label)!
+    test.assert(hnswgraph.drift(all) == 1.0)
+
+    test.case("and the entry point can be reused and still leads into the graph")
+    let hits = hnswsearch.search(back, [2.0], 3, 3)!
+    test.assert(list.len(hits) == 3)
+    Ok(())
+
+@test
+fn test_check_names_each_corruption() [io]
+    report(corruptions())
+
+fn corruptions() -> Result<Unit, HnswFault> [io]
+    let ix = small()!
+    let lv = ix.levels
+    let st = ix.link_starts
+    let ln = ix.links
+    let ct = ix.link_counts
+    let lb = ix.labels
+
+    test.case("a list of the wrong length")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, [0, 1], st, ln, ct, lb, 1, 1))) ==
+                "lengths")
+
+    test.case("a negative level, and a top level that is not the highest")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, [0, 0 - 1, 0], st, ln, ct, lb, 1, 1))) ==
+                "level")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, ln, ct, lb, 1, 2))) ==
+                "top_level")
+
+    test.case("a run that starts in the wrong place, and lists of the wrong total")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, [0, 5, 10], ln, ct, lb, 1, 1))) ==
+                "link_start")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, list.concat(ln, [0]), ct, lb, 1,
+                                                      1))) == "links")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, ln, list.concat(ct, [0]), lb, 1,
+                                                      1))) == "link_counts")
+
+    test.case("an entry point off the top level, and an empty index with one")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, ln, ct, lb, 0, 1))) == "entry")
+    let empty = hnswgraph.index(ix.params)
+    test.assert(corrupt_field(hnswgraph.check(altered(empty, [], [], [], [], [], 0, 0 - 1))) ==
+                "entry")
+
+    test.case("a count above the maximum, and links off the end, to itself or repeated")
+    var many = ct[:]
+    many[0] = 9
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, ln, many, lb, 1, 1))) ==
+                "link_count")
+    var wild = ln[:]
+    wild[0] = 7
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, wild, ct, lb, 1, 1))) ==
+                "neighbour")
+    var upward = ln[:]
+    upward[8] = 2
+    var upward_counts = ct[:]
+    upward_counts[2] = 1
+    // Slot 1's level-1 run, at 8 after slot 0's four slots and slot 1's
+    // four at level 0, now links to slot 2, which has no level 1.
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, upward, upward_counts, lb, 1,
+                                                      1))) == "neighbour")
+
+    test.case("and two elements with one label")
+    test.assert(corrupt_field(hnswgraph.check(altered(ix, lv, st, ln, ct, [1, 1, 3], 1, 1))) ==
+                "label")
+    Ok(())
+
+@test
+fn test_from_bytes_names_each_bad_field() [io]
+    report(bad_files())
+
+fn bad_files() -> Result<Unit, HnswFault> [io]
+    let ix = small()!
+    let good = hnswio.to_bytes(ix)!
+
+    test.case("a buffer shorter than the room claimed is full at its own length")
+    match hnswio.write_into(ix, bytes.zeros(16), 1000)
+        Ok(w)  => test.fail("${w} bytes into sixteen")
+        Err(f) => test.assert(f.message() == "${bytes.len(good)} byte(s) into room for 16")
+
+    test.case("a version this reader does not know")
+    var v2 = bytes.clone(good)
+    bytes.set_u32_le(v2, 4, 2)
+    test.assert(read_field(v2) == "index format 2 is not one this reader knows")
+
+    test.case("fewer bytes than the header says")
+    test.assert(read_field(bytes.slice(good, 0, bytes.len(good) - 1)) ==
+                "1 more byte(s) wanted at ${bytes.len(good) - 1}")
+
+    test.case("a metric code, an M and a multiplier that describe no index")
+    var metric = bytes.clone(good)
+    bytes.set_u32_le(metric, 24, 9)
+    test.assert(read_field(metric) == "params")
+    var m1 = bytes.clone(good)
+    bytes.set_u32_le(m1, 28, 1)
+    test.assert(read_field(m1) == "params")
+    var ml = bytes.clone(good)
+    bytes.set_u64_le(ml, 56, float.to_bits(0.0))
+    test.assert(read_field(ml) == "level_multiplier")
+
+    test.case("a count the total cannot hold")
+    var count = bytes.clone(good)
+    bytes.set_u64_le(count, 16, 1000000)
+    test.assert(read_field(count) == "count")
+
+    test.case("a negative level")
+    var level = bytes.clone(good)
+    // The levels follow 96 bytes of header and fields, three vectors of
+    // one coordinate, three labels and three marks.
+    bytes.set_u64_le(level, 96 + 24 + 24 + 3, 0 - 1)
+    test.assert(read_field(level) == "level")
+
+    test.case("a total that is not the sum of the fields")
+    var longer = bytes.concat([good, bytes.zeros(8)])
+    bytes.set_u64_le(longer, 40, bytes.len(good) + 8)
+    test.assert(read_field(longer) == "total_bytes")
+
+    test.case("and a graph the check refuses")
+    var looped = bytes.clone(good)
+    // The first link of slot 0 made to point at slot 0.
+    let links_at = bytes.len(good) - list.len(ix.links) * 8
+    bytes.set_u64_le(looped, links_at, 0)
+    test.assert(read_field(looped) == "neighbour")
+    Ok(())

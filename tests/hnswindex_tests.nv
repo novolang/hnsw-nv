@@ -1,24 +1,14 @@
-// hnswindex_tests.nv — the API suite for the index: insert with the
-// caller's uniform, the graph's own invariants, k-nearest search and
-// the `ef` contract, delete by mark, and the serialised form's round
-// trip.
+// hnswindex_tests.nv — the index: insert with the caller's uniform, the
+// graph's own invariants, k-nearest search and the `ef` contract,
+// delete by mark, and the serialised form's round trip.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: hnsw-nv.<module>.<fn>`.
+// The uniforms are written down.  A build is a function of the vectors
+// and the uniform sequence, so the graph is the same on every run and an
+// assertion about an edge is an assertion rather than a flake.
 //
-// THE UNIFORMS ARE WRITTEN DOWN, and that is the point of the design
-// rather than a convenience for the suite.  rand-nv is `host` and this
-// package is `core`, so the draw is the caller's — which means a build
-// is a pure function of the vectors and the uniform sequence, and this
-// file is an example of the thing that buys: a graph that is the same
-// on every machine, every run, so an assertion about an edge is an
-// assertion and not a flake.
-//
-// THE REFERENCE IMPLEMENTATION IS THE ORACLE, and it arrives beside
-// this file as a generated run when the bodies land: hnswlib built over
-// the same vectors with the same parameters and the same level
-// sequence, edge for edge, and recall@10 over the SIFT1M and GIST1M
-// query sets compared at four values of `ef`.
+// `hnswrecall_tests.nv` measures recall against the exact answer over
+// seeded random vectors, and `hnswedges_tests.nv` refuses a corrupt
+// index and a corrupt file field by field.
 
 use std.test
 use std.bytes
@@ -30,8 +20,8 @@ use hnswio
 use hnswerr
 
 // Four unit vectors on the axes of a two-dimensional plane, and the
-// uniforms that put the first on level 1 and the rest on level 0 — so
-// the graph has a top and a bottom and the descent has something to
+// uniforms that put the first above level 0 and the rest on it, so the
+// graph has a top and a bottom and the descent has something to
 // descend.
 fn axes() -> [[Float]]
     [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
@@ -113,7 +103,7 @@ fn test_an_insert_refuses_what_it_cannot_store() [io]
                 Ok(ix) => test.fail("a 3-vector into a 2-index of ${hnswgraph.count(ix)}")
                 Err(f) => test.assert(hnswerr.is_usage(f))
 
-            test.case("a uniform outside [0, 1) is refused rather than clamped")
+            test.case("a uniform outside (0, 1) is refused rather than clamped")
             match hnswgraph.insert(e, 1, [1.0, 0.0], 1.0)
                 Ok(ix) => test.fail("a uniform of 1.0 inserted into ${hnswgraph.count(ix)}")
                 Err(f) => test.assert(hnswerr.is_usage(f))

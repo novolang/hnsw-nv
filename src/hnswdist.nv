@@ -1,47 +1,39 @@
 // hnswdist.nv — the three distances, as an enum and as functions.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Everything here is a distance, and smaller is nearer, because every
+// comparison HNSW makes is a minimum: the priority queues keep the
+// smallest and the greedy descent walks downhill.  The two
+// similarity-shaped metrics are therefore stored in their distance
+// forms:
 //
-// EVERYTHING HERE IS A DISTANCE, NOT A SIMILARITY, AND THE SIGN IS THE
-// WHOLE REASON.  HNSW is a nearest-neighbour structure: every
-// comparison it makes is "is this smaller", every priority queue is a
-// minimum, and the graph's greedy descent walks downhill.  A metric
-// that answered a similarity would invert all three, so this package
-// defines the two similarity-shaped metrics as their distance forms and
-// says so in one place:
+//     squared L2      sum((a_i - b_i)^2)
+//     cosine          1 - dot(a, b) / (|a| * |b|), in [0, 2]
+//     inner product   1 - dot(a, b)
 //
-//   - COSINE distance is `1 - cos(a, b)`, in [0, 2].  Zero is
-//     identical, one is orthogonal, two is opposite.
-//   - INNER PRODUCT distance is `1 - dot(a, b)`, which for normalised
-//     vectors IS the cosine distance and for unnormalised ones is not
-//     a metric at all — it breaks the triangle inequality, and the
-//     graph built on it is heuristic in a way the other two are not.
-//     hnswlib spells it the same way and calls it `InnerProductSpace`;
-//     the README says what that costs.
-//   - SQUARED L2 is `sum((a_i - b_i)^2)`, and it is squared on
-//     purpose: the square root is monotonic, so it changes no ordering
-//     and no graph, and it costs a call per comparison in the hottest
-//     loop there is.  `l2` is there for a caller that wants the actual
-//     distance to report.
+// Squared L2 is squared on purpose.  The square root is monotonic, so it
+// changes no ordering and no graph, and it would cost a call per
+// comparison.  `l2` is the real distance, for reporting.
 //
-// A ROW IS A `[Float]`.  Not an `NdFloat`: an index holds N rows of one
-// dimension it already knows, so a shape, a stride set and an offset
-// per row would restate a fact it holds once, and the hot path is one
-// walk down two flat buffers.  See the README.
+// Inner product is the cosine distance on unit vectors and is not a
+// metric on others: it breaks the triangle inequality, so a graph built
+// on it has no proof behind its descent.  hnswlib's `InnerProductSpace`
+// is the same definition.
 //
-// THESE FUNCTIONS AGREE WITH embeddings-nv'S BY DEFINITION AND NOT BY
-// SYMBOL.  That package computes the same three over `NdFloat` and this
-// one over `[Float]`; the definitions are the same nine lines and the
-// test vectors are shared, checked as an assertion in both suites
-// rather than as a dependency in either.  Thirty lines of arithmetic is
-// not worth putting a vector library in every consumer of an index.
+// A row is a `[Float]`.  embeddings-nv computes the same three over
+// `NdFloat`, and the definitions and the test vectors agree.
+//
+// Every function here refuses two vectors of different lengths with
+// `HnswDimMismatch`, a coordinate that is not a finite number with
+// `HnswNotFinite` at its position in the left vector and then the
+// right, and a zero vector under cosine with `HnswZeroNorm`.
+
+use std.list
+use std.math
 
 // Which distance an index compares by.
 //
-// Fixed when the index is built and serialised with it: an index
-// searched with a different metric from the one it was built with
-// answers, and answers wrongly, because the graph's edges were chosen
-// under the first.
+// Fixed when the index is built, and serialised with it, because the
+// graph's edges were chosen under it.
 //
 // ```novo
 // use hnswdist
@@ -64,34 +56,48 @@ pub enum HnswMetric
 
 // The metric's name, lower case: "l2", "cosine", "inner".
 //
-// What `hnswio` writes into a serialised index as text rather than as
-// a code, so that a file whose format version this package does not
-// know still says what it was built for.
+// The spelling a command line or a configuration file uses.
 pub fn metric_name(m: HnswMetric) -> Str
-    todo("hnsw-nv.hnswdist.metric_name")
+    match m
+        HnswL2     => "l2"
+        HnswCosine => "cosine"
+        HnswInner  => "inner"
 
 // The metric a name spells, for a command line or a config file.
 pub fn metric_of_name(name: Str) -> ?HnswMetric
-    todo("hnsw-nv.hnswdist.metric_of_name")
+    match name
+        "l2"     => Some(HnswL2)
+        "cosine" => Some(HnswCosine)
+        "inner"  => Some(HnswInner)
+        _        => None
 
-// The code `hnswio` stores beside the name: 0 for L2, 1 for cosine,
-// 2 for inner product.
+// The code `hnswio` stores: 0 for L2, 1 for cosine, 2 for inner
+// product.
 pub fn metric_code(m: HnswMetric) -> Int
-    todo("hnsw-nv.hnswdist.metric_code")
+    match m
+        HnswL2     => 0
+        HnswCosine => 1
+        HnswInner  => 2
 
-// The metric a code names.
+// The metric a code names, or `HnswBadParam` naming "metric" for a code
+// that names none.
 pub fn metric_of_code(code: Int) -> Result<HnswMetric, HnswFault>
-    todo("hnsw-nv.hnswdist.metric_of_code")
+    match code
+        0 => Ok(HnswL2)
+        1 => Ok(HnswCosine)
+        2 => Ok(HnswInner)
+        _ => Err(HnswBadParam("metric", code))
 
 // Whether this metric wants its vectors normalised before they go in.
 //
-// True for cosine and for inner product, false for L2.  Not a thing
-// this package does for the caller — see `normalize` — but a thing it
-// will say, because the single commonest way to get poor results out
-// of a vector index is to build it with an inner-product metric over
-// vectors nobody normalised.
+// True for cosine and for inner product, false for L2.  This package
+// does not normalise on the caller's behalf, and an inner-product index
+// over vectors nobody normalised is the commonest way to get poor
+// results out of one.
 pub fn wants_normalized(m: HnswMetric) -> Bool
-    todo("hnsw-nv.hnswdist.wants_normalized")
+    match m
+        HnswL2 => false
+        _      => true
 
 // The distance between two vectors under this metric.
 //
@@ -109,70 +115,105 @@ pub fn wants_normalized(m: HnswMetric) -> Bool
 //         Err(f) => println(f.message())
 // ```
 pub fn distance(m: HnswMetric, left: [Float], right: [Float]) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswdist.distance")
+    check_pair(left, right)!
+    match m
+        HnswL2     => Ok(squared_of(left, right))
+        HnswInner  => Ok(1.0 - dot_of(left, right))
+        HnswCosine => cosine_of(left, right)
 
 // Squared Euclidean distance: the sum of the squared differences.
 //
-// Squared on purpose.  The square root is monotonic, so taking it
-// changes no ordering, no priority queue and no graph — and it costs
-// one call per comparison in a loop that runs `ef` times per level per
-// query.  Every internal comparison in this package uses this one.
+// Squared on purpose: the square root changes no ordering.  An `HnswL2`
+// index compares by this.
 pub fn l2_squared(left: [Float], right: [Float]) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswdist.l2_squared")
+    distance(HnswL2, left, right)
 
 // Euclidean distance: the square root of `l2_squared`.
 //
-// Here so that a caller REPORTING a distance to a user has the real
-// number rather than a square they have to explain.  Nothing inside
-// this package calls it.
+// For a caller reporting a distance to a person.
 pub fn l2(left: [Float], right: [Float]) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswdist.l2")
+    Ok(math.sqrt(l2_squared(left, right)!))
 
 // Cosine distance: `1 - cos(a, b)`, in [0, 2].
 //
 // `HnswZeroNorm` for a zero vector on either side.
 pub fn cosine(left: [Float], right: [Float]) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswdist.cosine")
+    distance(HnswCosine, left, right)
 
 // Inner-product distance: `1 - dot(a, b)`.
 //
-// No normalisation, no norms computed, and no metric guarantee: for
-// vectors that are not unit length this breaks the triangle
-// inequality, which means the graph's greedy descent has no proof
-// behind it and recall is an empirical question rather than a bounded
-// one.  hnswlib makes the same choice and it works well in practice;
-// the README says under what conditions.
+// No norms are computed.  On vectors that are not unit length it may be
+// negative, and it breaks the triangle inequality.
 pub fn inner(left: [Float], right: [Float]) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswdist.inner")
+    distance(HnswInner, left, right)
 
 // The dot product.
 //
-// Public because it is the one piece of arithmetic a caller doing its
-// own re-ranking over the results needs, and because `inner` and
-// `cosine` are both written in terms of it.
+// For a caller re-ranking results with its own arithmetic.
 pub fn dot(left: [Float], right: [Float]) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswdist.dot")
+    check_pair(left, right)!
+    Ok(dot_of(left, right))
 
-// The Euclidean length of a vector.
+// The Euclidean length of a vector.  `HnswNotFinite` at the first
+// coordinate that is not a number.
 pub fn norm(v: [Float]) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswdist.norm")
+    check_finite(v)!
+    Ok(math.sqrt(dot_of(v, v)))
 
 // The vector scaled to unit length.
 //
-// `HnswZeroNorm` for a zero vector.  NOT done for the caller on the
-// way into an index, deliberately: an index that normalised what it
-// was given would answer a cosine query correctly and hand back a
-// vector the caller did not store, and a caller that wanted L2 over
-// magnitudes would find them gone.  `hnswparam.HnswParams` has no
-// normalise flag for the same reason — normalising is one call, at the
-// point where the caller knows whether it wants it.
+// `HnswZeroNorm` for a zero vector.  An index never does this on the
+// caller's behalf: it would hand back a vector the caller did not
+// store, and a caller comparing magnitudes would find them gone.
 pub fn normalize(v: [Float]) -> Result<[Float], HnswFault>
-    todo("hnsw-nv.hnswdist.normalize")
+    let n = norm(v)!
+    if n == 0.0
+        return Err(HnswZeroNorm)
+    Ok(v |> list.map(x => x / n))
 
 // Whether every coordinate is a finite number.
 //
-// The check every vector gets on the way into an index.  Public
-// because a caller filtering a batch before it inserts wants to do the
-// check once rather than meet `HnswNotFinite` on the seventeenth row.
+// The check every vector gets on the way into an index, for a caller
+// filtering a batch before it inserts.
 pub fn is_finite_vector(v: [Float]) -> Bool
-    todo("hnsw-nv.hnswdist.is_finite_vector")
+    first_not_finite(v) < 0
+
+// The position of the first coordinate that is not finite, or -1.
+fn first_not_finite(v: [Float]) -> Int
+    for i in 0..list.len(v)
+        if math.is_nan(v[i]) or math.is_inf(v[i])
+            return i
+    0 - 1
+
+fn check_finite(v: [Float]) -> Result<Unit, HnswFault>
+    let at = first_not_finite(v)
+    if at >= 0
+        return Err(HnswNotFinite(at))
+    Ok(())
+
+// `Ok` when the two have one length and every coordinate is finite.
+fn check_pair(left: [Float], right: [Float]) -> Result<Unit, HnswFault>
+    if list.len(left) != list.len(right)
+        return Err(HnswDimMismatch(list.len(left), list.len(right)))
+    check_finite(left)!
+    check_finite(right)
+
+fn dot_of(a: [Float], b: [Float]) -> Float
+    var s = 0.0
+    for i in 0..list.len(a)
+        s = s + a[i] * b[i]
+    s
+
+fn squared_of(a: [Float], b: [Float]) -> Float
+    var s = 0.0
+    for i in 0..list.len(a)
+        let d = a[i] - b[i]
+        s = s + d * d
+    s
+
+fn cosine_of(a: [Float], b: [Float]) -> Result<Float, HnswFault>
+    let na = dot_of(a, a)
+    let nb = dot_of(b, b)
+    if na == 0.0 or nb == 0.0
+        return Err(HnswZeroNorm)
+    Ok(1.0 - dot_of(a, b) / (math.sqrt(na) * math.sqrt(nb)))

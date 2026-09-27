@@ -1,48 +1,36 @@
 // hnswsearch.nv — k-nearest search, and the two layers of it the
 // algorithm is made of.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// `ef` is the knob, and it is per query.  A search keeps a candidate
+// list of `ef` elements as it descends: a larger one finds more and
+// costs more, and `k` is only how many of them come back.  An `ef` below
+// `k` could not return `k` answers, and it is refused.  Every other
+// parameter is fixed when the index is built.
 //
-// `ef` IS THE KNOB, AND IT IS PER QUERY.  A search keeps a candidate
-// list of `ef` elements as it descends; larger finds more and costs
-// more, and `k` is only how many of them are returned.  `ef` below `k`
-// is a query that cannot return `k` answers, and this package refuses
-// it rather than quietly returning fewer.
+// The descent is Algorithm 5 of Malkov and Yashunin.  From the entry
+// point, `greedy_step` walks each level above 0 to the element nearest
+// the query, and `search_layer` then searches level 0 with the caller's
+// `ef`.  Both are public, for a caller doing what the top-level calls do
+// not cover, such as a sharded search or a recall harness that wants
+// the candidates.
 //
-// Everything else about a query is fixed when the index is built.  That
-// asymmetry is the reason `ef` is an argument here and every other
-// parameter is a field on `HnswParams`: the caller changes `ef` between
-// a typeahead and a report over the same index, and changes nothing
-// else without rebuilding.
+// A deleted element is walked through and not returned, as hnswlib
+// does, so a search of an index that is mostly marks still costs what
+// the graph costs.  `hnswgraph.drift` measures that.
 //
-// THE DESCENT, IN TWO FUNCTIONS.  `search_layer` is the algorithm's
-// only real routine — a greedy best-first walk over one level from one
-// entry point, keeping `ef` candidates — and `search` is that run once
-// per level from the top with `ef = 1`, then once at level 0 with the
-// caller's `ef`.  Both are public because the second is the whole of
-// HNSW and a caller doing something the top-level API does not cover —
-// a filtered search over a shard, a two-stage re-rank, a recall
-// harness that wants the candidates rather than the answers — needs the
-// first rather than a reimplementation of it.
-//
-// A DELETED ELEMENT IS WALKED THROUGH AND NOT RETURNED.  It is still a
-// hop, because removing it would cut the graph; it is not a result,
-// because it is deleted.  That is hnswlib's behaviour and it means a
-// search of an index that is mostly marks still costs what the graph
-// costs, which is what `hnswgraph.drift` is for.
-//
-// RESULTS ARE SORTED, NEAREST FIRST, AND CARRY THE DISTANCE.  Not the
-// similarity: the distance is what the index compared by, the metric
-// says which one, and a caller that wants a cosine similarity has
-// `1 - d`.  Handing back the number the structure actually used is the
-// only way a caller can check a result against its own arithmetic.
+// Results are sorted nearest first, and two at the same distance by
+// slot.  They carry the distance the index compared by, under its
+// metric: squared for L2, and `1 - similarity` for the other two.
+
+use std.list
+use hnswparam
+use hnswgraph
+use hnswwalk
 
 // One answer: a label and how far it was.
 //
-// The distance is under the index's own metric and in the index's own
-// units — squared for L2, because that is what the comparison used.
-// `hnswdist.l2` is there for a caller reporting a real distance to a
-// person.
+// The distance is under the index's own metric, squared for L2.
+// `hnswdist.l2` is the real distance, for reporting to a person.
 //
 // ```novo
 // use hnswsearch
@@ -54,18 +42,14 @@
 pub struct HnswHit
     // The caller's own id, as it was handed to `insert`.
     label: Int
-    // The distance under the index's metric.  Smaller is nearer,
-    // always: the two similarity-shaped metrics are stored as
-    // `1 - similarity` so that every comparison in the package is a
-    // minimum.
+    // The distance under the index's metric.  Smaller is nearer.
     distance: Float
 
 // One candidate during a descent: an element index and its distance.
 //
-// An element index rather than a label, because that is what the
-// graph is addressed by and a descent that converted per hop would
-// pay for a lookup it does not need.  `search_layer` answers these and
-// `search` converts once, at the end.
+// A slot rather than a label, because that is what the graph is
+// addressed by.  `search_layer` answers these, and `search` converts to
+// labels once, at the end.
 pub struct HnswCandidate
     // The element's slot in the index, not its label.
     slot: Int
@@ -74,8 +58,8 @@ pub struct HnswCandidate
 
 // The `k` nearest live elements to a query.
 //
-// Sorted nearest first, and shorter than `k` when the index holds
-// fewer live elements than that.
+// Sorted nearest first, and shorter than `k` when fewer than `k` live
+// elements are found.
 //
 // `HnswDimMismatch` for a query of the wrong length, `HnswNotFinite`
 // for one holding a value that is not a number, `HnswZeroNorm` for a
@@ -97,103 +81,102 @@ pub struct HnswCandidate
 //                             // : an index with nothing in it
 // ```
 pub fn search(ix: HnswIndex, query: [Float], k: Int, ef: Int) -> Result<[HnswHit], HnswFault>
-    todo("hnsw-nv.hnswsearch.search")
+    descend(ix, query, k, ef, hnswwalk.keep_all)
 
 // The `k` nearest, with `ef` chosen by `hnswparam.default_ef`.
 //
-// For the caller that has not measured anything yet.  The default is
-// `max(k, ef_construction / 4)`, which is a starting point and not a
-// recommendation — `ef` is the one number worth measuring per
-// workload, and the README says how.
+// For a caller that has measured nothing yet.  The default is
+// `max(k, ef_construction / 4)`, a starting point rather than a
+// recommendation.
 pub fn search_default(ix: HnswIndex, query: [Float], k: Int) -> Result<[HnswHit], HnswFault>
-    todo("hnsw-nv.hnswsearch.search_default")
+    search(ix, query, k, hnswparam.default_ef(ix.params, k))
 
 // The `k` nearest live elements whose label `keep` accepts.
 //
-// The predicate is a NAMED FUNCTION rather than a closure, and it
-// takes the label rather than the element: a caller filtering by
-// tenant, by permission or by recency has that in a table of its own,
-// keyed by the id it gave this index.
+// The predicate takes the label, since a caller filtering by tenant or
+// by permission keeps that in a table keyed by its own ids.
 //
-// The filter is applied during the descent and not after it, which is
-// what makes it useful: filtering afterwards over a `k` of 10 gives
-// fewer than 10 results whenever the filter is at all selective, and
-// the usual workaround — ask for 10 times as many — costs ten times as
-// much and still has no bound.  Applied during the descent, `ef` is
-// the budget and the result is `k` long whenever `k` live matching
-// elements are reachable.
-//
-// What it cannot promise: a filter that accepts almost nothing turns
-// the search into a walk of the graph, because the candidate list
-// fills with elements the filter rejects.  `HnswEmptyIndex` is not
-// what comes back then — a short result is — and a caller whose
-// filters are that selective wants one index per partition instead.
+// The filter is applied at level 0 during the search, as hnswlib's
+// `isIdAllowed` is: an element the filter rejects is walked through and
+// not answered, and the search keeps walking until it holds `ef`
+// accepted answers or has nothing left to explore.  Filtering afterwards
+// would give fewer than `k` results whenever the filter is at all
+// selective.  A filter that accepts almost nothing turns the search into
+// a walk of the graph, and a caller whose filters are that selective
+// wants one index per partition.  The faults are those of `search`.
 pub fn search_filtered(ix: HnswIndex, query: [Float], k: Int, ef: Int,
                        keep: fn(Int) -> Bool) -> Result<[HnswHit], HnswFault>
-    todo("hnsw-nv.hnswsearch.search_filtered")
+    descend(ix, query, k, ef, keep)
 
-// The greedy best-first walk over ONE level, from one entry point,
-// keeping `ef` candidates.
+// The best-first walk over one level, from one entry point, keeping `ef`
+// candidates: Algorithm 2 of the paper.
 //
-// The algorithm's only real routine, and the whole of HNSW: `search`
-// is this run with `ef = 1` from the top level down to level 1, and
-// then once at level 0 with the caller's `ef`.  Public because a
-// caller doing something the top-level API does not cover needs this
-// rather than a reimplementation — a two-stage re-rank, a recall
-// harness that wants candidates rather than answers, a sharded search
-// that merges the candidate lists itself.
-//
-// Answers candidates sorted nearest first, deleted elements INCLUDED —
-// they are hops and this is the hop-level routine.  `search` is where
-// the marks are filtered out, because that is where "a result" starts
-// to mean something.
+// Answers candidates sorted nearest first, deleted elements included,
+// since at this level they are hops.  The faults of `search` for the
+// query, `HnswNoSuchLabel` with the slot for an entry out of range, and
+// `HnswBadParam` for an `ef` below 1 or a level the entry does not
+// occupy.
 pub fn search_layer(ix: HnswIndex, query: [Float], entry: Int, ef: Int,
                     level: Int) -> Result<[HnswCandidate], HnswFault>
-    todo("hnsw-nv.hnswsearch.search_layer")
+    hnswwalk.check_query(ix.params, query)!
+    if ef < 1
+        return Err(HnswBadParam("ef", ef))
+    hnswgraph.degree(ix, entry, level)!
+    let f = hnswwalk.layer(ix, query, [entry], ef, level, false, hnswwalk.keep_all)
+    Ok(list.range(0, list.len(f.slots))
+       |> list.map(i => HnswCandidate { slot: f.slots[i], distance: f.dists[i] }))
 
 // The nearest single element on a level, walking greedily from an
 // entry point.
 //
 // `search_layer` with `ef = 1`, which is what the descent through the
-// upper levels does.  Named because it is the shape a caller
-// implementing its own descent writes, and because `ef = 1` reads as a
-// magic number at a call site.
+// upper levels does.  Answers the slot.
 pub fn greedy_step(ix: HnswIndex, query: [Float], entry: Int, level: Int) -> Result<Int, HnswFault>
-    todo("hnsw-nv.hnswsearch.greedy_step")
+    let found = search_layer(ix, query, entry, 1, level)!
+    Ok(found[0].slot)
 
 // The exact `k` nearest, by comparing the query with every live
 // element.
 //
-// No graph, no `ef`, no approximation: the answer HNSW is trying to
-// approximate.  Linear in the index's size, so it is not for serving —
-// it is for the two places an exact answer is what is wanted: a recall
-// measurement, and an index small enough that the graph is not worth
-// descending.  `recall_at` takes this and a `search` result
-// and gives the number.
+// No graph and no approximation, at a cost linear in the index's size:
+// the answer a recall measurement compares with, and the right search
+// for an index small enough that the graph is not worth descending.
+// Ties are broken by slot.  The faults of `search` for `k` and the
+// query, and `HnswEmptyIndex` for an index with nothing in it.
 pub fn brute_force(ix: HnswIndex, query: [Float], k: Int) -> Result<[HnswHit], HnswFault>
-    todo("hnsw-nv.hnswsearch.brute_force")
+    if k < 1
+        return Err(HnswBadParam("k", k))
+    hnswwalk.check_query(ix.params, query)!
+    if hnswgraph.count(ix) == 0
+        return Err(HnswEmptyIndex)
+    var ranked: [(Float, Int)] = []
+    for s in 0..hnswgraph.count(ix)
+        if not ix.deleted[s]
+            list.push(ranked, (hnswwalk.to_slot(ix, query, s), s))
+    list.sort(ranked)
+    let take = if k < list.len(ranked)
+        k
+    else
+        list.len(ranked)
+    Ok(ranked[0:take] |> list.map(r => HnswHit { label: ix.labels[r.1], distance: r.0 }))
 
 // The distance from a query to one labelled element.
 //
-// For a caller that has a result set from somewhere else — a keyword
-// search, a previous query, a cache — and wants the index's own
-// arithmetic over it rather than its own reimplementation of the
-// metric.
+// For a caller with a result set from somewhere else, such as a keyword
+// search, that wants the index's own arithmetic over it.  The faults of
+// `search` for the query, and `HnswNoSuchLabel`.
 pub fn distance_to(ix: HnswIndex, query: [Float], label: Int) -> Result<Float, HnswFault>
-    todo("hnsw-nv.hnswsearch.distance_to")
+    hnswwalk.check_query(ix.params, query)!
+    let Some(s) = hnswgraph.slot_of(ix, label) else return Err(HnswNoSuchLabel(label))
+    Ok(hnswwalk.to_slot(ix, query, s))
 
 // The fraction of an exact result the approximate one found.
 //
 // `|approx ∩ exact| / |exact|`, by label, which is what "recall@k"
-// means everywhere it is quoted.  1.0 when the approximate search
-// found every one of them, and 0.0 for an empty exact set — an
-// undefined ratio reported as the least flattering number, because
-// the alternative is a harness that reports perfect recall over a
-// query that matched nothing.
-//
-// The measurement this whole structure exists to trade against, and
-// the reason `brute_force` is public.  A caller tuning `ef` runs both
-// over a sample of real queries and reads the curve.
+// means.  1.0 when the approximate search found every one, and 0.0 for
+// an empty exact set, so a harness never reports perfect recall over a
+// query that matched nothing.  A caller tuning `ef` runs `search` and
+// `brute_force` over a sample of real queries and reads the curve.
 //
 // ```novo
 // use hnswsearch
@@ -203,22 +186,60 @@ pub fn distance_to(ix: HnswIndex, query: [Float], label: Int) -> Result<Float, H
 //     // : 0
 // ```
 pub fn recall_at(approx: [HnswHit], exact: [HnswHit]) -> Float
-    todo("hnsw-nv.hnswsearch.recall_at")
+    if list.len(exact) == 0
+        return 0.0
+    let found = hit_labels(approx)
+    let hits = list.count(exact, h => list.contains(found, h.label))
+    hits as Float / list.len(exact) as Float
 
 // The labels of a result set, in order.
 //
-// For a caller joining the answers back to its own records, and for
-// `recall_at`'s own comparison.  Named because "map the label out of
-// each hit" is written at every call site otherwise.
+// For a caller joining the answers back to its own records.
 pub fn hit_labels(hits: [HnswHit]) -> [Int]
-    todo("hnsw-nv.hnswsearch.hit_labels")
+    hits |> list.map(h => h.label)
 
 // How many distance computations a search of this index with this `ef`
 // is expected to make.
 //
-// The cost model, so that a caller choosing `ef` can see the shape of
-// the trade before it measures rather than after.  An estimate from
-// the index's own level histogram and degrees — not a measurement, and
-// the README says what it leaves out.
+// An estimate from the index's own degrees: the mean degree at each
+// level above 0, one greedy hop per level, plus `ef` times the mean
+// degree at level 0.  It leaves out the extra hops a greedy walk takes
+// and the candidates a level-0 search expands past `ef`, so it is a
+// shape to compare values of `ef` by rather than a count.  0.0 for an
+// empty index.
 pub fn expected_comparisons(ix: HnswIndex, ef: Int) -> Float
-    todo("hnsw-nv.hnswsearch.expected_comparisons")
+    var total = 0.0
+    for l in 0..ix.top_level + 1
+        let per = mean_degree(ix, l)
+        total = total + (if l == 0 then per * ef as Float else per)
+    total
+
+fn mean_degree(ix: HnswIndex, level: Int) -> Float
+    var sum = 0
+    var n = 0
+    for s in 0..hnswgraph.count(ix)
+        if ix.levels[s] >= level
+            sum = sum + ix.link_counts[hnswwalk.count_at(ix, s, level)]
+            n = n + 1
+    sum as Float / n as Float
+
+// The descent, with `keep` applied at level 0.
+fn descend(ix: HnswIndex, query: [Float], k: Int, ef: Int,
+           keep: fn(Int) -> Bool) -> Result<[HnswHit], HnswFault>
+    if k < 1
+        return Err(HnswBadParam("k", k))
+    if ef < k
+        return Err(HnswBadParam("ef", ef))
+    hnswwalk.check_query(ix.params, query)!
+    if hnswgraph.count(ix) == 0
+        return Err(HnswEmptyIndex)
+    var eps = [ix.entry]
+    for l in list.rev(list.range(1, ix.top_level + 1))
+        eps = hnswwalk.layer(ix, query, eps, 1, l, false, hnswwalk.keep_all).slots[:]
+    let f = hnswwalk.layer(ix, query, eps, ef, 0, true, keep)
+    let take = if k < list.len(f.slots)
+        k
+    else
+        list.len(f.slots)
+    Ok(list.range(0, take) |> list.map(i => HnswHit { label: ix.labels[f.slots[i]],
+                                                      distance: f.dists[i] }))

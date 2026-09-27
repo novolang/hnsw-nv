@@ -1,51 +1,56 @@
 // hnswio.nv — the serialised form: an index written into a caller's
 // buffer and read back, with a magic and a version on the front.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// hnswlib's `saveIndex` writes its own memory: the element size, then
+// the per-element blocks as the process laid them out, with no magic, no
+// version and no dimension.  A file read by the wrong build produces an
+// index rather than an error.  This format has a magic, a version, every
+// parameter, and every field at a stated width, little-endian.  A file
+// it did not write is refused at the fourth byte, and a file it did
+// write reads back equal to the index that wrote it.
 //
-// IT IS NOT hnswlib'S FILE, AND THAT IS DELIBERATE.  hnswlib's
-// `saveIndex` writes its own memory: the element size in bytes, then
-// the raw per-element blocks exactly as the process laid them out.  The
-// file is therefore specific to the pointer width, the endianness, the
-// `size_t` of the machine that wrote it, and the version of the library
-// — and it carries no magic, no version and no dimension, so a file
-// read by the wrong build produces an index rather than an error.
+// The layout, with every integer a signed 64-bit value unless it says
+// otherwise:
 //
-// This format has a magic, a version, the parameters in full, and every
-// field written at a stated width in a stated byte order.  A file this
-// package wrote is readable by any build of it on any machine, and a
-// file it did not write is refused at the fourth byte.
+//     offset  field
+//     0       magic, 4 bytes: "NVHW"
+//     4       format version, 32 bits
+//     8       dim
+//     16      element count, deleted ones included
+//     24      metric code, 32 bits
+//     28      M, 32 bits
+//     32      ef_construction
+//     40      total bytes, this header included
+//     48      capacity
+//     56      level multiplier, a 64-bit IEEE 754 float
+//     64      entry point
+//     72      top level
+//     80      slots reused by `insert_replacing`
+//     88      length of the link list
+//     96      the vectors, `count * dim` 64-bit floats
+//             the labels, `count` values
+//             the marks, `count` bytes, 1 for deleted
+//             the levels, `count` values
+//             the link counts, one per element per level
+//             the links
 //
-// WHAT TRAVELS AND WHAT DOES NOT.  Everything that makes the index what
-// it is travels: the parameters including the level multiplier, every
-// vector, every label, every mark, every level and every link.  So a
-// read-back index is EQUAL to the one that was written, which is an
-// assertion in the suite and not a hope — a serialisation that
-// round-trips approximately is one that quietly changes results.
-//
-// WHY A WRITER INTO A CALLER'S BUFFER.  `to_bytes` is the convenient
-// call; `write_into` is the one for a caller that has already reserved
-// the space — a preallocated file, a memory-mapped region, a page of a
-// key/value store — because an index is the biggest value this package
-// makes and copying it to hand it over is a cost worth being able to
-// avoid.  `size_bound` is exact, not an upper bound: every field's
-// width follows from the parameters and the counts.
-//
-// THE FLOATS ARE WRITTEN AS 64-BIT IEEE 754, little-endian, and that
-// is the format's one extravagance.  An index of a million 768-element
-// vectors is 6 GB rather than 3, and a caller that minds has two
-// answers, both better than a lossy serialisation: quantise before
-// inserting, with embeddings-nv, so the index stores what it will
-// compare; or keep the vectors outside and hold only ids.  Writing
-// f32 here would round every vector on the way out and produce an
-// index that is not the one that was saved.
+// Where each element's links start is not stored: it follows from the
+// levels.  The vectors are 64-bit floats, so a million of 768
+// coordinates is 6 GB.  Writing them narrower would round every vector
+// and produce an index that is not the one that was saved.
+
+use std.list
+use std.bytes
+use std.float
+use hnswparam
+use hnswdist
+use hnswgraph
 
 // What a serialised index says about itself before its bytes.
 //
-// Read by `peek_header` without reading the index, which is what a
-// cache validating an entry wants: a header is 48 bytes and tells it
-// whether the dimension, the metric and the format version still match
-// what it is about to search.
+// `peek_header` reads it without reading the index.  A cache
+// validating an entry reads 48 bytes to learn whether the dimension, the
+// metric and the format version still match what it will search.
 //
 // ```novo
 // use hnswio
@@ -69,42 +74,39 @@ pub struct HnswFileHeader
     // The `ef_construction` it was built with.
     ef_construction: Int
     // How many bytes the whole serialised index is, this header
-    // included.  Carried so that a caller reading from a stream knows
-    // how much to read, and so that a truncation is caught before the
-    // parse rather than during it.
+    // included, so a caller reading from a stream knows how much to
+    // read.
     total_bytes: Int
 
-// The four magic bytes, as a little-endian 32-bit integer.
-//
-// The thing hnswlib's own file does not have, and the reason a file
-// from the wrong tool is an error here rather than an index.
+// The four magic bytes, "NVHW", as a little-endian 32-bit integer.
 pub fn magic_le() -> Int
-    todo("hnsw-nv.hnswio.magic_le")
+    0x5748564E
 
 // The format version this package writes: 1.
 //
-// Bumped when a field is added, removed or re-widened.  A reader
-// refuses a version it does not know rather than reading the fields it
-// recognises, because a graph half-read is a graph that answers.
+// Raised when a field is added, removed or widened.  A reader refuses a
+// version it does not know rather than reading the fields it
+// recognises.
 pub fn format_version() -> Int
-    todo("hnsw-nv.hnswio.format_version")
+    1
 
 // The versions this package reads.
 pub fn supported_versions() -> [Int]
-    todo("hnsw-nv.hnswio.supported_versions")
+    [1]
 
 // How many bytes the header occupies: 48.
 pub fn header_bytes() -> Int
-    todo("hnsw-nv.hnswio.header_bytes")
+    48
 
 // Exactly how many bytes this index serialises to.
 //
-// Exact rather than an upper bound.  The header, then the parameters,
-// then `count * dim` doubles, then the labels, the marks, the levels,
-// the link counts and the links — every one of those a stated width
-// times a known count.
+// Exact rather than an upper bound: every field is a stated width times
+// a known count, as the module comment lays out.  The index is not
+// checked; `hnswgraph.check` does that.
 pub fn size_bound(ix: HnswIndex) -> Result<Int, HnswFault>
-    todo("hnsw-nv.hnswio.size_bound")
+    let n = hnswgraph.count(ix)
+    Ok(96 + n * ix.params.dim * 8 + n * 8 + n + n * 8 + list.len(ix.link_counts) * 8
+       + list.len(ix.links) * 8)
 
 // The index's bytes.
 //
@@ -122,15 +124,53 @@ pub fn size_bound(ix: HnswIndex) -> Result<Int, HnswFault>
 //                 Err(f) => println(f.message())
 // ```
 pub fn to_bytes(ix: HnswIndex) -> Result<Bytes, HnswFault>
-    todo("hnsw-nv.hnswio.to_bytes")
+    let size = size_bound(ix)!
+    var out = bytes.zeros(size)
+    write_into(ix, out, size)!
+    Ok(out)
 
 // The index written into a buffer the caller sized.
 //
-// `HnswOutputFull` with both numbers when `room` is smaller than
-// `size_bound`, and the count written when it is not.  The buffer is
-// not resized and nothing past that count is touched.
-pub fn write_into(ix: HnswIndex, into: Bytes, room: Int) -> Result<Int, HnswFault>
-    todo("hnsw-nv.hnswio.write_into")
+// `HnswOutputFull` with both numbers when `room`, or the buffer's own
+// length if that is smaller, is less than `size_bound`, and the count
+// written when it is not.  The buffer is written from offset 0, is not
+// resized, and nothing past that count is touched.
+pub fn write_into(ix: HnswIndex, var into: Bytes, room: Int) -> Result<Int, HnswFault>
+    let size = size_bound(ix)!
+    let have = if bytes.len(into) < room
+        bytes.len(into)
+    else
+        room
+    if have < size
+        return Err(HnswOutputFull(size, have))
+    let p = ix.params
+    let n = hnswgraph.count(ix)
+    bytes.set_u32_le(into, 0, magic_le())
+    bytes.set_u32_le(into, 4, format_version())
+    bytes.set_u64_le(into, 8, p.dim)
+    bytes.set_u64_le(into, 16, n)
+    bytes.set_u32_le(into, 24, hnswdist.metric_code(p.metric))
+    bytes.set_u32_le(into, 28, p.m)
+    bytes.set_u64_le(into, 32, p.ef_construction)
+    bytes.set_u64_le(into, 40, size)
+    bytes.set_u64_le(into, 48, p.capacity)
+    bytes.set_u64_le(into, 56, float.to_bits(p.level_multiplier))
+    bytes.set_u64_le(into, 64, ix.entry)
+    bytes.set_u64_le(into, 72, ix.top_level)
+    bytes.set_u64_le(into, 80, ix.replaced)
+    bytes.set_u64_le(into, 88, list.len(ix.links))
+    var at = 96
+    for x in ix.data
+        bytes.set_u64_le(into, at, float.to_bits(x))
+        at = at + 8
+    at = put_ints(into, at, ix.labels)
+    for d in ix.deleted
+        bytes.set_u8(into, at, (if d then 1 else 0))
+        at = at + 1
+    at = put_ints(into, at, ix.levels)
+    at = put_ints(into, at, ix.link_counts)
+    at = put_ints(into, at, ix.links)
+    Ok(at)
 
 // The header, from the first `header_bytes` of a serialised index.
 //
@@ -138,35 +178,123 @@ pub fn write_into(ix: HnswIndex, into: Bytes, room: Int) -> Result<Int, HnswFaul
 // `HnswBadVersion` for a version this package does not read, and
 // `HnswTruncated` when there are fewer than 48 bytes.
 //
-// The call a cache makes before it commits to reading six gigabytes:
-// the dimension and the metric are here, and an entry built for a
-// different model is discarded without being parsed.
+// The call a cache makes before it reads the rest: the dimension and the
+// metric are here, and an entry built for a different model is
+// discarded without being parsed.
 pub fn peek_header(b: Bytes) -> Result<HnswFileHeader, HnswFault>
-    todo("hnsw-nv.hnswio.peek_header")
+    if bytes.len(b) < 48
+        return Err(HnswTruncated(bytes.len(b), 48 - bytes.len(b)))
+    let magic = u32_at(b, 0)
+    if magic != magic_le()
+        return Err(HnswBadMagic(magic))
+    let version = u32_at(b, 4)
+    if not list.contains(supported_versions(), version)
+        return Err(HnswBadVersion(version))
+    Ok(HnswFileHeader { version: version, dim: i64_at(b, 8), metric: u32_at(b, 24),
+                        count: i64_at(b, 16), m: u32_at(b, 28), ef_construction: i64_at(b, 32),
+                        total_bytes: i64_at(b, 40) })
 
 // The index, from its bytes.
 //
-// Runs `hnswgraph.check` before it answers, so a file that reads back
-// into an inconsistent graph is `HnswCorruptGraph` here rather than a
-// wrong answer three hours later.  That check is the reason this is a
-// `Result` over a graph fault as well as over the format ones.
+// The faults of `peek_header`, then `HnswTruncated` when there are fewer
+// bytes than the header's total, and `HnswCorruptGraph` for a header
+// whose parameters or sizes do not describe an index: "params",
+// "level_multiplier", "count" or "total_bytes".  It runs
+// `hnswgraph.check` before it answers, so a file that reads back into an
+// inconsistent graph is refused here rather than answering worse.
 pub fn from_bytes(b: Bytes) -> Result<HnswIndex, HnswFault>
-    todo("hnsw-nv.hnswio.from_bytes")
+    let h = peek_header(b)!
+    if bytes.len(b) < h.total_bytes
+        return Err(HnswTruncated(bytes.len(b), h.total_bytes - bytes.len(b)))
+    let p = params_of(b, h)!
+    let n = h.count
+    let links_len = i64_at(b, 88)
+    // Every element costs at least its vector, its label, its mark, its
+    // level and one link count, so the header's counts are checked
+    // against the total, one bound at a time so that no product can
+    // overflow, before anything is read.
+    let total = h.total_bytes
+    if p.dim > total / 8 or n < 0 or n > total / (p.dim * 8 + 25) or links_len < 0
+       or links_len > total / 8 or 96 + n * (p.dim * 8 + 25) + links_len * 8 > total
+        return Err(HnswCorruptGraph("count", n))
+    var at = 96
+    var data: [Float] = []
+    for _ in 0..n * p.dim
+        list.push(data, float.from_bits(i64_at(b, at)))
+        at = at + 8
+    let labels = ints_at(b, at, n)
+    at = at + n * 8
+    let deleted = list.range(0, n) |> list.map(i => byte_at(b, at + i) != 0)
+    at = at + n
+    let levels = ints_at(b, at, n)
+    at = at + n * 8
+    var counts_len = 0
+    var starts: [Int] = []
+    var start = 0
+    for l in levels
+        if l < 0 or l > h.total_bytes
+            return Err(HnswCorruptGraph("level", l))
+        list.push(starts, start)
+        start = start + 2 * p.m + p.m * l
+        counts_len = counts_len + l + 1
+    if at + counts_len * 8 + links_len * 8 != h.total_bytes
+        return Err(HnswCorruptGraph("total_bytes", h.total_bytes))
+    let counts = ints_at(b, at, counts_len)
+    at = at + counts_len * 8
+    let links = ints_at(b, at, links_len)
+    let ix = HnswIndex { params: p, data: data, labels: labels, deleted: deleted, levels: levels,
+                         link_starts: starts, links: links, link_counts: counts,
+                         entry: i64_at(b, 64), top_level: i64_at(b, 72), replaced: i64_at(b, 80) }
+    hnswgraph.check(ix)!
+    Ok(ix)
 
 // Whether these bytes start with this format's magic.
 //
-// Four bytes is enough.  The sniff a caller makes over a directory of
-// cache files before it decides which are its.
+// Four bytes are enough, for a caller sorting a directory of cache
+// files.
 pub fn is_index(b: Bytes) -> Bool
-    todo("hnsw-nv.hnswio.is_index")
+    bytes.len(b) >= 4 and u32_at(b, 0) == magic_le()
 
 // Whether a serialised index can be searched with these parameters.
 //
-// The dimension and the metric must match exactly; `M` and
-// `ef_construction` need not, because they shaped the graph that was
-// saved and do not constrain a search of it.  The distinction a cache
-// wants and gets wrong in both directions: refusing a perfectly good
-// index because a tuning parameter moved, or accepting one built for a
-// different model because only the dimension was compared.
+// The dimension and the metric must match.  `M` and `ef_construction`
+// need not, because they shaped the graph that was saved and do not
+// constrain a search of it.
 pub fn header_matches(h: HnswFileHeader, p: HnswParams) -> Bool
-    todo("hnsw-nv.hnswio.header_matches")
+    h.dim == p.dim and h.metric == hnswdist.metric_code(p.metric)
+
+// The parameters a header and the fixed fields after it describe, or
+// `HnswCorruptGraph` when they describe none.
+fn params_of(b: Bytes, h: HnswFileHeader) -> Result<HnswParams, HnswFault>
+    let metric = match hnswdist.metric_of_code(h.metric)
+        Ok(m)  => m
+        Err(_) =>
+            return Err(HnswCorruptGraph("params", 24))
+    let p = match hnswparam.params(h.dim, metric, h.m, h.ef_construction, i64_at(b, 48))
+        Ok(p)  => p
+        Err(_) =>
+            return Err(HnswCorruptGraph("params", 8))
+    match hnswparam.with_level_multiplier(p, float.from_bits(i64_at(b, 56)))
+        Ok(q)  => Ok(q)
+        Err(_) => Err(HnswCorruptGraph("level_multiplier", 56))
+
+fn put_ints(var into: Bytes, from: Int, xs: [Int]) -> Int
+    var at = from
+    for x in xs
+        bytes.set_u64_le(into, at, x)
+        at = at + 8
+    at
+
+// The reads below are at offsets the caller has checked against the
+// buffer's length.
+fn u32_at(b: Bytes, at: Int) -> Int
+    bytes.u32_le_at(b, at) ?? 0
+
+fn i64_at(b: Bytes, at: Int) -> Int
+    bytes.u64_le_at(b, at) ?? 0
+
+fn byte_at(b: Bytes, at: Int) -> Int
+    bytes.byte_at(b, at) ?? 0
+
+fn ints_at(b: Bytes, from: Int, count: Int) -> [Int]
+    list.range(0, count) |> list.map(i => i64_at(b, from + i * 8))

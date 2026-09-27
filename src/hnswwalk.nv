@@ -1,0 +1,246 @@
+// hnswwalk.nv — the walks the insert and the search share: a distance to
+// a stored element, one level's best-first search, and the neighbour
+// selection heuristic.
+//
+// Package-internal.  `hnswgraph` builds with these and `hnswsearch`
+// searches with them, and neither module depends on the other.
+//
+// Every list of candidates here is ordered by distance and then by slot,
+// so that two elements at the same distance come out in the same order
+// on every run.
+
+use std.list
+use std.math
+
+// A best-first search's answer: parallel lists of distances and slots,
+// nearest first.
+struct Found
+    dists: [Float]
+    slots: [Int]
+
+// Where the links of element `slot` at `level` start in `ix.links`.
+// Level 0 comes first, `2 * M` slots long, and each level above it `M`
+// long.
+fn base_of(ix: HnswIndex, slot: Int, level: Int) -> Int
+    let m = ix.params.m
+    if level == 0
+        return ix.link_starts[slot]
+    ix.link_starts[slot] + 2 * m + (level - 1) * m
+
+// Where the link count of element `slot` at `level` sits in
+// `ix.link_counts`.  Element `i` owns `levels[i] + 1` counts, and the
+// position follows from its link start: every element before it holds
+// `2 * M` link slots and one count at level 0, and `M` slots and one
+// count at every level above, so the counts before it are
+// `i + (link_starts[i] - i * 2 * M) / M`.
+fn count_at(ix: HnswIndex, slot: Int, level: Int) -> Int
+    let m = ix.params.m
+    slot + (ix.link_starts[slot] - slot * 2 * m) / m + level
+
+// The neighbours of element `slot` at `level`, as slots.
+fn links_of(ix: HnswIndex, slot: Int, level: Int) -> [Int]
+    let base = base_of(ix, slot, level)
+    ix.links[base:base + ix.link_counts[count_at(ix, slot, level)]]
+
+// The distance from a query to a stored element, under the index's
+// metric.  The query has been checked, so nothing here can refuse.
+fn to_slot(ix: HnswIndex, q: [Float], slot: Int) -> Float
+    let dim = ix.params.dim
+    let at = slot * dim
+    var dot = 0.0
+    var qq = 0.0
+    var vv = 0.0
+    var sq = 0.0
+    for i in 0..dim
+        let a = q[i]
+        let b = ix.data[at + i]
+        dot = dot + a * b
+        qq = qq + a * a
+        vv = vv + b * b
+        let d = a - b
+        sq = sq + d * d
+    match ix.params.metric
+        HnswL2     => sq
+        HnswInner  => 1.0 - dot
+        HnswCosine => 1.0 - dot / (math.sqrt(qq) * math.sqrt(vv))
+
+// The vector stored in a slot.
+fn vector_at(ix: HnswIndex, slot: Int) -> [Float]
+    let dim = ix.params.dim
+    ix.data[slot * dim:slot * dim + dim]
+
+// Whether a query can be compared with this index: the index's length,
+// every coordinate finite, and not a zero vector under cosine.
+fn check_query(p: HnswParams, q: [Float]) -> Result<Unit, HnswFault>
+    if list.len(q) != p.dim
+        return Err(HnswDimMismatch(p.dim, list.len(q)))
+    for i in 0..list.len(q)
+        if math.is_nan(q[i]) or math.is_inf(q[i])
+            return Err(HnswNotFinite(i))
+    match p.metric
+        HnswCosine =>
+            if list.all(q, x => x == 0.0)
+                return Err(HnswZeroNorm)
+        _          => ()
+    Ok(())
+
+// Whether `(d, s)` comes before `(e, t)`: nearer first, then the lower
+// slot.
+fn before(d: Float, s: Int, e: Float, t: Int) -> Bool
+    d < e or d == e and s < t
+
+// A filter that accepts every label, for the searches that have none.
+fn keep_all(label: Int) -> Bool
+    true
+
+// Distances and slots held in two lists, of which the first `n`
+// entries are in use.  The lists only grow, and an entry past `n` is
+// stale.  A binary heap and a sorted list are both kept this way.
+struct Queue
+    var d: [Float]
+    var s: [Int]
+    var n: Int
+
+fn queue() -> Queue
+    Queue { d: [], s: [], n: 0 }
+
+// Store `(d, s)` at position `i`, which is at most the lists' length.
+fn put(var q: Queue, i: Int, d: Float, s: Int)
+    if i < list.len(q.d)
+        q.d[i] = d
+        q.s[i] = s
+    else
+        list.push(q.d, d)
+        list.push(q.s, s)
+
+// One level's best-first search from `entries`, Algorithm 2 of the
+// paper as hnswlib runs it.
+//
+// Every element reachable at `level` is a candidate to walk through.
+// Only an element `accepts` passes can be an answer: a live one when
+// `skip_deleted` is set, and one whose label `keep` passes.  The walk
+// stops when the nearest unexplored candidate is further than the
+// furthest of `ef` answers.  While fewer than `ef` answers are held it
+// keeps walking, which is how a filter that rejects most elements still
+// finds `ef` of the ones it accepts when they are reachable.
+fn layer(ix: HnswIndex, q: [Float], entries: [Int], ef: Int, level: Int, skip_deleted: Bool,
+         keep: fn(Int) -> Bool) -> Found
+    let n = list.len(ix.labels)
+    var visited = list.range(0, n) |> list.map(_ => false)
+    // The candidates still to explore, a heap nearest first, and the
+    // answers, a sorted list of at most `ef`.
+    var todo_ = queue()
+    var found = queue()
+    for e in entries
+        if not visited[e]
+            visited[e] = true
+            let d = to_slot(ix, q, e)
+            heap_push(todo_, d, e)
+            if accepts(ix, e, skip_deleted, keep)
+                sorted_insert(found, d, e, ef)
+    // Each element enters the heap once, so it empties within `n` pops.
+    for _ in 0..n
+        if todo_.n == 0
+            break
+        let d = todo_.d[0]
+        let c = todo_.s[0]
+        if found.n >= ef and d > found.d[found.n - 1]
+            break
+        heap_pop(todo_)
+        for e in links_of(ix, c, level)
+            if not visited[e]
+                visited[e] = true
+                let de = to_slot(ix, q, e)
+                if found.n < ef or de < found.d[found.n - 1]
+                    heap_push(todo_, de, e)
+                    if accepts(ix, e, skip_deleted, keep)
+                        sorted_insert(found, de, e, ef)
+    Found { dists: found.d[0:found.n], slots: found.s[0:found.n] }
+
+fn accepts(ix: HnswIndex, slot: Int, skip_deleted: Bool, keep: fn(Int) -> Bool) -> Bool
+    if skip_deleted and ix.deleted[slot]
+        return false
+    keep(ix.labels[slot])
+
+// Insert `(d, s)` into a sorted queue that holds at most `cap`.  When
+// the queue is full the caller has checked that `(d, s)` is nearer than
+// its last entry, which it then replaces.
+fn sorted_insert(var w: Queue, d: Float, s: Int, cap: Int)
+    var at = w.n
+    if w.n < cap
+        put(w, w.n, d, s)
+        w.n = w.n + 1
+    else
+        at = w.n - 1
+    for _ in 0..w.n
+        if at == 0 or not before(d, s, w.d[at - 1], w.s[at - 1])
+            break
+        w.d[at] = w.d[at - 1]
+        w.s[at] = w.s[at - 1]
+        at = at - 1
+    w.d[at] = d
+    w.s[at] = s
+
+// Push `(d, s)` onto a heap.
+fn heap_push(var h: Queue, d: Float, s: Int)
+    put(h, h.n, d, s)
+    h.n = h.n + 1
+    var at = h.n - 1
+    for _ in 0..h.n
+        if at == 0
+            break
+        let up = (at - 1) / 2
+        if not before(h.d[at], h.s[at], h.d[up], h.s[up])
+            break
+        swap(h, at, up)
+        at = up
+
+// Remove the nearest entry of a heap.
+fn heap_pop(var h: Queue)
+    h.n = h.n - 1
+    swap(h, 0, h.n)
+    var at = 0
+    for _ in 0..h.n
+        let l = 2 * at + 1
+        if l >= h.n
+            break
+        let r = l + 1
+        let child = if r < h.n and before(h.d[r], h.s[r], h.d[l], h.s[l])
+            r
+        else
+            l
+        if not before(h.d[child], h.s[child], h.d[at], h.s[at])
+            break
+        swap(h, at, child)
+        at = child
+
+fn swap(var h: Queue, a: Int, b: Int)
+    let d = h.d[a]
+    let s = h.s[a]
+    h.d[a] = h.d[b]
+    h.s[a] = h.s[b]
+    h.d[b] = d
+    h.s[b] = s
+
+// The neighbour selection heuristic, Algorithm 4 of the paper as
+// hnswlib's `getNeighborsByHeuristic2` runs it.  The candidates come
+// nearest first, with their distances to the element being linked.  A
+// candidate is kept unless an element already kept is nearer to it than
+// the element being linked is, and at most `m` are kept.  The effect is
+// that the links point in different directions rather than all at one
+// cluster.
+fn select(ix: HnswIndex, near: Found, m: Int) -> [Int]
+    var kept: [Int] = []
+    for i in 0..list.len(near.slots)
+        if list.len(kept) >= m
+            break
+        let c = near.slots[i]
+        let own = vector_at(ix, c)
+        var good = true
+        for r in kept
+            if to_slot(ix, own, r) < near.dists[i]
+                good = false
+                break
+        if good
+            list.push(kept, c)
+    kept
