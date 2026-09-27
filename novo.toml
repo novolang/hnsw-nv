@@ -37,7 +37,9 @@ category    = "ai"
 tags        = ["hnsw", "ann", "nearest-neighbour", "vector-index", "similarity", "search", "embeddings", "sans-io"]
 repository  = "https://github.com/novolang/hnsw-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+# 0.13.0 is the first toolchain with lists as reference types and `var`
+# parameters, which `hnswio.write_into` writes through.
+novo        = ">= 0.13.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
