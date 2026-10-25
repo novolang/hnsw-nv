@@ -29,6 +29,7 @@
 
 use std.list
 use std.math
+use hnswerr
 
 // Which distance an index compares by.
 //

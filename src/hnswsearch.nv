@@ -26,6 +26,7 @@ use std.list
 use hnswparam
 use hnswgraph
 use hnswwalk
+use hnswerr
 
 // One answer: a label and how far it was.
 //

@@ -45,6 +45,7 @@ use std.float
 use hnswparam
 use hnswdist
 use hnswgraph
+use hnswerr
 
 // What a serialised index says about itself before its bytes.
 //
@@ -126,7 +127,7 @@ pub fn size_bound(ix: HnswIndex) -> Result<Int, HnswFault>
 pub fn to_bytes(ix: HnswIndex) -> Result<Bytes, HnswFault>
     let size = size_bound(ix)!
     var out = bytes.zeros(size)
-    write_into(ix, out, size)!
+    write_into(ix, var out, size)!
     Ok(out)
 
 // The index written into a buffer the caller sized.
@@ -163,13 +164,13 @@ pub fn write_into(ix: HnswIndex, var into: Bytes, room: Int) -> Result<Int, Hnsw
     for x in ix.data
         bytes.set_u64_le(into, at, float.to_bits(x))
         at = at + 8
-    at = put_ints(into, at, ix.labels)
+    at = put_ints(var into, at, ix.labels)
     for d in ix.deleted
         bytes.set_u8(into, at, (if d then 1 else 0))
         at = at + 1
-    at = put_ints(into, at, ix.levels)
-    at = put_ints(into, at, ix.link_counts)
-    at = put_ints(into, at, ix.links)
+    at = put_ints(var into, at, ix.levels)
+    at = put_ints(var into, at, ix.link_counts)
+    at = put_ints(var into, at, ix.links)
     Ok(at)
 
 // The header, from the first `header_bytes` of a serialised index.

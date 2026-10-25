@@ -16,6 +16,8 @@ use hnswparam
 use hnswgraph
 use hnswsearch
 use hnswio
+use hnswdist
+use hnswerr
 
 // Park and Miller's generator: the state is in 1 ..= 2^31 - 2, so a
 // uniform drawn from it is strictly inside (0, 1).
@@ -29,7 +31,7 @@ fn uniform(var r: Rng) -> Float
 fn point(var r: Rng, dim: Int) -> [Float]
     var v: [Float] = []
     for _ in 0..dim
-        list.push(v, 2.0 * uniform(r) - 1.0)
+        list.push(v, 2.0 * uniform(var r) - 1.0)
     v
 
 fn build(n: Int, dim: Int, metric: HnswMetric, seed: Int) -> Result<HnswIndex, HnswFault>
@@ -37,8 +39,8 @@ fn build(n: Int, dim: Int, metric: HnswMetric, seed: Int) -> Result<HnswIndex, H
     let p = hnswparam.params(dim, metric, 12, 100, n)!
     var ix = hnswgraph.index(p)
     for i in 0..n
-        let v = point(r, dim)
-        ix = hnswgraph.insert(ix, i, v, uniform(r))!
+        let v = point(var r, dim)
+        ix = hnswgraph.insert(ix, i, v, uniform(var r))!
     Ok(ix)
 
 // Recall@k averaged over `queries` random queries.
@@ -46,7 +48,7 @@ fn mean_recall(ix: HnswIndex, queries: Int, k: Int, ef: Int, seed: Int) -> Resul
     var r = Rng { state: seed }
     var total = 0.0
     for _ in 0..queries
-        let q = point(r, ix.params.dim)
+        let q = point(var r, ix.params.dim)
         let approx = hnswsearch.search(ix, q, k, ef)!
         let exact = hnswsearch.brute_force(ix, q, k)!
         total = total + hnswsearch.recall_at(approx, exact)
@@ -171,7 +173,7 @@ fn deletions() -> Result<Unit, HnswFault> [io]
     var answered_deleted = 0
     var total = 0.0
     for _ in 0..20
-        let q = point(r, 8)
+        let q = point(var r, 8)
         let approx = hnswsearch.search(ix, q, 10, 64)!
         for h in approx
             if h.label % 10 == 0
@@ -184,7 +186,7 @@ fn deletions() -> Result<Unit, HnswFault> [io]
     var re = ix
     var rr = Rng { state: 99 }
     for i in 0..60
-        re = hnswgraph.insert_replacing(re, 1000 + i, point(rr, 8), uniform(rr))!
+        re = hnswgraph.insert_replacing(re, 1000 + i, point(var rr, 8), uniform(var rr))!
     test.assert(hnswgraph.count(re) == 600)
     test.assert(hnswgraph.deleted_count(re) == 0)
     test.assert(hnswgraph.check(re)! > 0)
@@ -203,7 +205,7 @@ fn filtered() -> Result<Unit, HnswFault> [io]
     var short = 0
     var total = 0.0
     for _ in 0..20
-        let q = point(r, 8)
+        let q = point(var r, 8)
         let hits = hnswsearch.search_filtered(ix, q, 10, 64, is_even_label)!
         if list.len(hits) < 10
             short = short + 1

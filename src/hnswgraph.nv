@@ -39,6 +39,7 @@
 use std.list
 use hnswparam
 use hnswwalk
+use hnswerr
 
 // An HNSW index.
 //
@@ -402,7 +403,7 @@ fn add(ix: HnswIndex, label: Int, v: [Float], level: Int) -> HnswIndex
                         link_starts: starts, links: links, link_counts: counts, entry: ix.entry,
                         top_level: ix.top_level, replaced: ix.replaced }
     if n > 0
-        connect(g, links, counts, n, v, level, [ix.entry], ix.top_level)
+        connect(g, var links, var counts, n, v, level, [ix.entry], ix.top_level)
     let raised = level > ix.top_level
     HnswIndex { params: p, data: data, labels: labels, deleted: deleted, levels: levels,
                 link_starts: starts, links: links, link_counts: counts,
@@ -428,9 +429,9 @@ fn connect(g: HnswIndex, var links: [Int], var counts: [Int], n: Int, v: [Float]
     for lc in list.rev(list.range(0, lowest + 1))
         let near = hnswwalk.layer(g, v, eps, p.ef_construction, lc, true, hnswwalk.keep_all)
         let chosen = hnswwalk.select(g, without(near, n), p.m)
-        write_run(g, links, counts, n, lc, chosen)
+        write_run(g, var links, var counts, n, lc, chosen)
         for e in chosen
-            link_back(g, links, counts, e, n, lc)
+            link_back(g, var links, var counts, e, n, lc)
         if list.len(near.slots) > 0
             eps = near.slots[:]
 
@@ -473,7 +474,7 @@ fn link_back(g: HnswIndex, var links: [Int], var counts: [Int], e: Int, n: Int, 
     list.push(ranked, (hnswwalk.to_slot(g, own, n), n))
     list.sort(ranked)
     let near = Found { dists: ranked |> list.map(r => r.0), slots: ranked |> list.map(r => r.1) }
-    write_run(g, links, counts, e, level, hnswwalk.select(g, near, room))
+    write_run(g, var links, var counts, e, level, hnswwalk.select(g, near, room))
 
 // Slot `s` given a new label and vector, unmarked, and linked again at
 // every level it occupies.
@@ -495,7 +496,7 @@ fn reuse(ix: HnswIndex, s: Int, label: Int, v: [Float]) -> HnswIndex
     // The slot's old links stay in place during the searches, so a walk
     // that starts at this slot, the entry point among others, still
     // leads into the graph.  Each level's run is then overwritten.
-    connect(g, links, counts, s, v, ix.levels[s], [ix.entry], ix.top_level)
+    connect(g, var links, var counts, s, v, ix.levels[s], [ix.entry], ix.top_level)
     g
 
 fn check_levels(ix: HnswIndex) -> Result<Unit, HnswFault>

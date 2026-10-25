@@ -18,6 +18,8 @@
 // same graph on every machine.
 
 use std.math
+use hnswdist
+use hnswerr
 
 // What an index was built with.
 //

@@ -11,6 +11,9 @@
 
 use std.list
 use std.math
+use hnswerr
+use hnswgraph
+use hnswparam
 
 // A best-first search's answer: parallel lists of distances and slots,
 // nearest first.
@@ -135,9 +138,9 @@ fn layer(ix: HnswIndex, q: [Float], entries: [Int], ef: Int, level: Int, skip_de
         if not visited[e]
             visited[e] = true
             let d = to_slot(ix, q, e)
-            heap_push(todo_, d, e)
+            heap_push(var todo_, d, e)
             if accepts(ix, e, skip_deleted, keep)
-                sorted_insert(found, d, e, ef)
+                sorted_insert(var found, d, e, ef)
     // Each element enters the heap once, so it empties within `n` pops.
     for _ in 0..n
         if todo_.n == 0
@@ -146,15 +149,15 @@ fn layer(ix: HnswIndex, q: [Float], entries: [Int], ef: Int, level: Int, skip_de
         let c = todo_.s[0]
         if found.n >= ef and d > found.d[found.n - 1]
             break
-        heap_pop(todo_)
+        heap_pop(var todo_)
         for e in links_of(ix, c, level)
             if not visited[e]
                 visited[e] = true
                 let de = to_slot(ix, q, e)
                 if found.n < ef or de < found.d[found.n - 1]
-                    heap_push(todo_, de, e)
+                    heap_push(var todo_, de, e)
                     if accepts(ix, e, skip_deleted, keep)
-                        sorted_insert(found, de, e, ef)
+                        sorted_insert(var found, de, e, ef)
     Found { dists: found.d[0:found.n], slots: found.s[0:found.n] }
 
 fn accepts(ix: HnswIndex, slot: Int, skip_deleted: Bool, keep: fn(Int) -> Bool) -> Bool
@@ -168,7 +171,7 @@ fn accepts(ix: HnswIndex, slot: Int, skip_deleted: Bool, keep: fn(Int) -> Bool) 
 fn sorted_insert(var w: Queue, d: Float, s: Int, cap: Int)
     var at = w.n
     if w.n < cap
-        put(w, w.n, d, s)
+        put(var w, w.n, d, s)
         w.n = w.n + 1
     else
         at = w.n - 1
@@ -183,7 +186,7 @@ fn sorted_insert(var w: Queue, d: Float, s: Int, cap: Int)
 
 // Push `(d, s)` onto a heap.
 fn heap_push(var h: Queue, d: Float, s: Int)
-    put(h, h.n, d, s)
+    put(var h, h.n, d, s)
     h.n = h.n + 1
     var at = h.n - 1
     for _ in 0..h.n
@@ -192,13 +195,13 @@ fn heap_push(var h: Queue, d: Float, s: Int)
         let up = (at - 1) / 2
         if not before(h.d[at], h.s[at], h.d[up], h.s[up])
             break
-        swap(h, at, up)
+        swap(var h, at, up)
         at = up
 
 // Remove the nearest entry of a heap.
 fn heap_pop(var h: Queue)
     h.n = h.n - 1
-    swap(h, 0, h.n)
+    swap(var h, 0, h.n)
     var at = 0
     for _ in 0..h.n
         let l = 2 * at + 1
@@ -211,7 +214,7 @@ fn heap_pop(var h: Queue)
             l
         if not before(h.d[child], h.s[child], h.d[at], h.s[at])
             break
-        swap(h, at, child)
+        swap(var h, at, child)
         at = child
 
 fn swap(var h: Queue, a: Int, b: Int)
